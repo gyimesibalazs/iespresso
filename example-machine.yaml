@@ -1,6 +1,9 @@
-# Example device config using the espresso boiler controller package.
-# ESP32 + ADS1115-read 10k NTC + SSR. Copy, adjust the hardware to your machine,
-# and put wifi_ssid / wifi_password / api_key / ota_password in secrets.yaml.
+# Complete example device config: ESP32 + ADS1115-read 10k NTC + heater SSR + pump SSR.
+# Copy, adjust the hardware to your machine, and put wifi_ssid / wifi_password /
+# api_key / ota_password / ap_password in secrets.yaml.
+#
+# For a machine WITHOUT a pump (e.g. a test rig), drop the `pump:` include, the
+# `pump_ssr` output and the binary_sensor block — keep only the controller bits.
 
 substitutions:
   # --- this machine's tuned values (the auto-tune overwrites these at runtime) ---
@@ -14,7 +17,8 @@ substitutions:
   # max_safe_temp, off_cap and the timeouts use the package defaults
 
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@main
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.2
+  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.2
 
 esphome:
   name: example-machine
@@ -33,17 +37,40 @@ i2c:
 
 ads1115:
   - address: 0x48
-    continuous_mode: false
+    continuous_mode: true
 
-# --- the heater SSR: the package drives this `output` (id MUST be `heater`) ---
+# --- SSR outputs: heater (id `heater`) + pump (id `pump_ssr`), required by the packages ---
 output:
-  - platform: ledc          # use slow_pwm for a zero-cross (integral-cycle) SSR
-    frequency: 1Hz
-    channel: 0
+  - platform: slow_pwm          # heater SSR (use ledc for a non-zero-cross SSR)
+    period: 1s
     id: heater
-    pin: 27
+    pin: 14
+  - platform: ledc              # pump SSR — set_pump_pct sets frequency + duty
+    pin: 19
+    channel: 1
+    frequency: 50Hz
+    id: pump_ssr
 
-# --- the temperature chain (the package needs the id `boiler_temperature`) ---
+# --- physical controls wired to GPIOs, calling the pump package's scripts ---
+binary_sensor:
+  - platform: gpio              # momentary jog button: full power while pressed
+    id: pump_button
+    pin: { number: 32, inverted: true, mode: { input: true, pullup: true } }
+    on_state:
+      then:
+        - script.stop: preinfusion_brew
+        - script.execute: { id: set_pump_pct, pct: !lambda 'return x ? 100 : 0;' }
+  - platform: gpio              # brew switch: pre-infusion + brew on press, stop on release
+    id: main_switch
+    pin: { number: 25, inverted: true, mode: { input: true, pullup: true } }
+    on_press:
+      then: { script.execute: preinfusion_brew }
+    on_release:
+      then:
+        - script.stop: preinfusion_brew
+        - script.execute: { id: set_pump_pct, pct: 0 }
+
+# --- the temperature chain (the controller package needs the id `boiler_temperature`) ---
 sensor:
   - platform: ntc
     sensor: resistance_sensor
@@ -62,14 +89,14 @@ sensor:
     name: Resistance Sensor
   - platform: ads1115
     multiplexer: 'A0_A1'
-    update_interval: 333ms
+    update_interval: 500ms
     gain: 2.048
     name: "Voltage measured"
     id: "voltage_sensor"
     filters:
-      - skip_initial: 5
+      - skip_initial: 3
       - median:
-          send_every: 3
+          send_every: 2
           send_first_at: 1
           window_size: 5
       - lambda: return (3.29/2.0) - x;
