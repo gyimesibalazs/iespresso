@@ -1,0 +1,1493 @@
+# =====================================================================
+#  REUSABLE ENERGY-BALANCE / SSR CONTROLLER  (ESPHome package)
+# =====================================================================
+#  Include from a device config:
+#    packages:
+#      controller: !include packages/espresso_controller.yaml
+#  The DEVICE file must provide:
+#    - an `output` with id `heater`         (the SSR driver: ledc or slow_pwm)
+#    - a `sensor` with id `boiler_temperature` and its source chain
+#  Tuned values and hardware power are passed via substitutions — override any of
+#  the defaults below in the device's own `substitutions:` block. The overnight
+#  tune and the daily adaptive overwrite the live values at runtime (restore_value
+#  keeps them across reboots); the substitutions are only the first-boot defaults.
+# =====================================================================
+substitutions:
+  base_power_w: "0.7"            # idle (controller/electronics) draw [W]
+  device_power_w: "1200"         # heater power [W]
+  max_safe_temp_c: "110.0"       # absolute emergency-stop temperature [C]
+  default_heating_power: "0.543" # P [C/s]      (real-boiler starting estimate)
+  default_coil_tau: "48.86"      # tau_coil [s]
+  default_lookahead_s: "2.5"     # sensor lag / projection lookahead [s]
+  default_off_tau_lag: "20.0"    # momentum offset time constant [s]
+  default_off_cap: "2.5"         # momentum offset clamp [C]
+  default_tau_cool: "7751.0"     # boiler free-cooling time constant [s]
+  tune_heat_timeout_s: "300"     # tune P2 timeout
+  tune_coast_timeout_s: "600"    # tune P3 coast timeout
+  adapt_observe_timeout_s: "1200"# daily adaptive observation timeout
+  # trace buffer length [s @ 1 Hz] = the longest window either recorder can produce
+  trace_len: "((${tune_heat_timeout_s} + ${tune_coast_timeout_s}) > ${adapt_observe_timeout_s} ? (${tune_heat_timeout_s} + ${tune_coast_timeout_s}) : ${adapt_observe_timeout_s})"
+
+globals:
+  - id: coil_Ts             # the coil's excess temperature [°C]: how many more °C it delivers
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: measurement_ready   # false until the first valid temperature sample has arrived.
+    type: bool              # While false: we do NOT heat (sensor is NaN/unknown at startup).
+    restore_value: no
+    initial_value: 'false'
+  - id: eta_to_sp_val        # estimated time [s] to reach the setpoint at full heat.
+    type: float             # -1 = at/near the setpoint (arrived/holding). Computed in
+    restore_value: no       # write_action, published by the sensor.
+    initial_value: '-1.0'
+  - id: projected_peak_val   # projected peak [°C] computed by write_action.
+    type: float              # SINGLE source: write_action writes it from its own (lookahead-free,
+    restore_value: no        # diagnostic) projection, the sensor only reads this — so there is
+    initial_value: '0.0'     # no separate interval / drift.
+  - id: last_heater_level    # last actually applied heating level (0..1)
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: quant_error          # error diffusion: the quantization remainder carried to the next cycle
+    type: float              # so that despite rounding to whole %, the long-term average
+    restore_value: no        # stays exact (reproduces the fractional demand precisely)
+    initial_value: '0.0'
+  - id: heating_mode         # legacy mode flag. In single-mode control it is forced true
+    type: bool               # every cycle; ctrl is always 1.0 and the model throttle
+    restore_value: no        # regulates both heatup and hold (no separate hold regulator).
+    initial_value: 'true'    # heatup at startup (we start from cold)
+  - id: stable               # true = boiler is stable (near setpoint, little heat in transit,
+    type: bool               # for at least 30s). The display inverts on this — at a glance
+    restore_value: no        # you can see the machine is ready for coffee.
+    initial_value: 'false'
+  - id: stable_since          # since when the stability condition holds (uint32_t!) — 0 = not holding
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: heatup_start          # millis() when the current heatup began (ETA active) — 0 = not heating up.
+    type: uint32_t            # used for the time-based heatup progress bar: progress = elapsed/(elapsed+ETA).
+    restore_value: no
+    initial_value: '0'
+
+  - id: prev_tb               # previous cycle's measured Tb — for the dTb/dt estimate that
+    type: float               # drives the momentum (lag) target offset. <=0 = not yet primed.
+    restore_value: no
+    initial_value: '-1.0'
+
+  - id: tb_rate_ema           # EMA-smoothed boiler heating rate [°C/s] (~20 s window).
+    type: float               # offset = OFF_TAU_LAG * max(rate,0) -> ~0 in hold by construction.
+    restore_value: no
+    initial_value: '0.0'
+
+  # ===== AUTO-TUNE (step-response) — THE ESP ONLY DRIVES THE EXPERIMENT =====
+  # The ESP does not compute or detect thresholds — it only produces the clean
+  # step-response (heat 100% -> switch off at a fixed 80°C -> let it decay ->
+  # repeat 3x). Phase boundaries are marked by the OUTPUT 0->1->0 transitions in
+  # the history. The precise fit (dead time, K/T, gamma, TAU_HB, tau_cool) is
+  # done AFTERWARDS from the history (Python regression), where it is accurate.
+  # Stop: automatically after 3 cycles (climate back to HEAT), OR implicitly if
+  # anyone switches the climate to HEAT (the state machine watches the mode).
+  - id: tune_phase           # 0=inactive, 1=waiting for a clean start,
+    type: int                # 2=heating(100%), 3=decay after switch-off
+    restore_value: no
+    initial_value: '0'
+  - id: tune_cycle           # which measurement cycle we are in (1..3)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: tune_t0              # timestamp of the phase start (ms)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: tune_hist_temp       # temperature from ~3 minutes ago, for trend detection
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_hist_t          # timestamp when tune_hist_temp was saved (ms)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: tune_msg             # status printed by the text_sensor
+    type: std::string
+    restore_value: no
+    initial_value: '"inactive"'
+
+  # --- overnight auto-tune measurement state (all volatile) ---
+  - id: tune_buf             # 1 Hz ring buffer of Tb for the slope estimators (24 s deep)
+    type: float[24]
+    restore_value: no
+  - id: tune_buf_i           # ring buffer write index
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: tune_buf_n           # how many valid samples the buffer holds (caps at 24)
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: tune_ton             # heating duration of the current cycle until the 80C cut [s]
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_cut_tb          # Tb at the cut
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_cut_slope       # 20s regression slope at the cut [°C/s]
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_trace           # 1 Hz Tb recording from heating start to the end of the coast —
+    type: float[${trace_len}]   # the FULL-CURVE on-device mini-fit runs on this
+    restore_value: no
+  - id: tune_trace_n         # number of valid samples in the trace
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: tune_fit_i           # incremental grid-fit state (0..480; >=480 = done/inactive)
+    type: int
+    restore_value: no
+    initial_value: '9999'
+  - id: tune_fit_bestC       # best SSE so far
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_bestP       # best P so far
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_bestTC      # best tau_coil so far
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_cP          # refinement-grid center (P)
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_cTC         # refinement-grid center (tau_coil)
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_bestL       # best L so far (global, across the 7 L planes)
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_curC        # best SSE within the CURRENT L plane (refinement center)
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_curP
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_fit_curTC
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_L               # per-cycle lookahead results, index 1..3 (0 = invalid)
+    type: float[4]
+    restore_value: no
+  - id: tune_peak            # running max Tb of the current coast
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_P               # per-cycle P results, index 1..3 (0 = invalid)
+    type: float[4]
+    restore_value: no
+  - id: tune_TC              # per-cycle tau_coil results, index 1..3 (0 = invalid)
+    type: float[4]
+    restore_value: no
+  - id: tune_cool_prevT      # previous 30-min cooling snapshot temperature
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_cool_prev_ms    # timestamp of the previous cooling snapshot (0 = none)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: tune_cool_vals       # collected tau_cool pair estimates (95..60C band)
+    type: float[8]
+    restore_value: no
+  - id: tune_cool_n          # number of collected tau_cool pairs
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: tune_Sr              # off_tau_lag regression accumulators (verification heatup):
+    type: float              # Sr=sum(rate), Srr=sum(rate^2), Srp=sum(rate*projected),
+    restore_value: no        # tau_lag = (peak*Sr - Srp)/Srr after the peak is known
+    initial_value: '0.0'
+  - id: tune_Srr
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_Srp
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_Sn
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: tune_vpeak           # running max Tb of the verification heatup
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: tune_vsp             # setpoint captured at verification start
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # --- ADAPTIVE DAILY CORRECTION (switch-gated observer on clean cold heatups) ---
+  # Reuses tune_trace/tune_trace_n, the tune_fit_* state, tune_Sr/Srr/Srp/Sn and
+  # tune_vpeak/tune_vsp: all of those are only touched by the overnight tune,
+  # the adaptive observer only runs at tune_phase==0 — never at the same time.
+  - id: adapt_phase          # 0 = idle, 1 = observing a cold heatup, 2 = fitting
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: adapt_t0             # observation start (ms)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: adapt_utrace         # 1 Hz applied-output (u) recording alongside tune_trace —
+    type: float[${trace_len}]   # the morning heatup is CLOSED-LOOP (u varies), so the
+    restore_value: no        # full-curve fit simulates with the RECORDED u
+  - id: adapt_ts0            # controller coil-state estimate at observation start —
+    type: float              # initializes Ts in the fit sim (the observer may join a
+    restore_value: no        # few seconds after the heatup began)
+    initial_value: '0.0'
+
+output:
+  # =====================================================================
+  #  MODEL-BASED THROTTLE — the template output that drives the heater.
+  #  The heater level comes entirely from the two-state model's proportional
+  #  predictive throttle (the climate's raw output is ignored), so we do not
+  #  overshoot. The existing max-temp protection stays.
+  # =====================================================================
+  - platform: template
+    id: pid_output
+    type: float
+    write_action:
+      - output.set_level:
+          id: heater
+          level: !lambda |-
+            // =====================================================================
+            //  COIL STATE + DIAGNOSTICS — in EVERY mode, at the START of write_action.
+            // =====================================================================
+            // write_action is the climate's heat_output, so the climate calls it on
+            // EVERY temperature sample (in HEAT, OFF and tuning mode too — the output is
+            // written on each update). The temperature read (1s) IS the
+            // trigger, so Tb is always FRESH here, and we step Ts with the actually applied
+            // level — no separate interval and no phase offset between the Ts update and
+            // the throttle decision (that caused the ~1s staleness). dt=1s (temperature
+            // sample rate).
+            {
+              float P_  = id(heating_power).state;
+              float tc_ = id(coil_tau).state;
+              float tcool_ = id(tau_cool).state;
+              float ts_ = id(coil_Ts);
+              const float Ta_ = 25.0f;
+              float u_  = id(last_heater_level);   // level applied in the PREVIOUS cycle
+              float Tb_meas = id(boiler_temperature).state;
+
+              // STARTUP / NaN GUARD. After power-on the temperature sensor has no valid
+              // value yet (NaN until the first median sample arrives). NaN would be
+              // "sticky", so we guard: if Ts is NaN, zero it, and do not heat until the
+              // first valid measurement (see measurement_ready in the throttle block).
+              bool meas_ok = !isnan(Tb_meas) && !isinf(Tb_meas);
+              if (isnan(ts_) || isinf(ts_)) ts_ = 0.0f;
+              if (meas_ok && !id(measurement_ready)) id(measurement_ready) = true;
+
+              // ===== PURE FEED-FORWARD COIL MODEL =====
+              // Ts (coil excess heat) comes SOLELY from heating: dTs/dt = P*u - Ts/tau_coil.
+              // On the real firmware this is correct — Ts is built from the ACTUALLY applied
+              // u every cycle. (We dropped the observer: the sensor lag is compensated by the
+              // throttle projection's LOOKAHEAD, not a state estimator. Simpler and needs
+              // fewer precisely-known parameters — the model is validated on the 3 steps, Ts
+              // at cutoff is ~24°C, matching the physical +25°C rise.) dt=1s.
+              ts_ += P_ * u_ - ts_ / tc_;
+              if (ts_ < 0.0f) ts_ = 0.0f;
+              id(coil_Ts) = ts_;
+
+              // diagnostic projection from the MEASURED Tb: "if I switch to 0 now, where is
+              // the peak" (lookahead-free — this is the raw, uncompensated projection for the
+              // display). The throttle decision uses the lookahead version (below).
+              float ts2 = ts_; float tb2 = meas_ok ? Tb_meas : 20.0f; float pk2 = tb2;
+              for (int i = 0; i < 600; i++) {
+                float d = ts2 / tc_ - (tb2 - Ta_) / tcool_;
+                ts2 += -ts2 / tc_; tb2 += d;
+                if (tb2 > pk2) pk2 = tb2;
+                if (ts2 < 0.01f) break;
+              }
+              id(projected_peak_val) = pk2;
+              id(coil_energy_sensor).publish_state(ts_);
+              id(projected_peak_sensor).publish_state(pk2);
+              id(eta_to_sp_sensor).publish_state(id(eta_to_sp_val));
+            }
+
+            // AUTO-TUNE guard: in tune phases 1-5 the state machine (interval) drives
+            // the heater DIRECTLY — write_action must not touch it, otherwise the two
+            // would compete for the heater output level. We return the current level.
+            // Phase 6 is the VERIFICATION heatup: there the NORMAL controller must run
+            // (the tune machine only accumulates the off_tau_lag regression), so the
+            // guard deliberately lets phase 6 through.
+            // (Ts above was ALREADY updated with the applied level, so the coil model follows.)
+            if (id(tune_phase) > 0 && id(tune_phase) < 6) {
+              // keep the power sensor alive during tuning — the tune machine maintains
+              // last_heater_level alongside its direct heater writes
+              id(calculated_power).publish_state(id(last_heater_level) * id(device_power).state + ${base_power_w}f);
+              return id(last_heater_level);
+            }
+
+            // OFF MODE guard: if the climate is not in HEAT mode, the user turned it
+            // off — under no circumstances should we heat. We set heating_mode to true so
+            // that on restart (switching back to HEAT) it starts cleanly in heatup mode.
+            // We also reset the integrator (windup-free).
+            // (Ts above was ALREADY updated with u=0 — we set it to 0 in the previous
+            //  cycle — so the coil decays correctly in OFF mode too.)
+            if (id(boiler_pid).mode != climate::CLIMATE_MODE_HEAT) {
+              id(last_heater_level) = 0.0f;
+              id(heating_mode) = true;
+              id(stable) = false;
+              id(stable_since) = 0;
+              id(heatup_start) = 0;          // clear the progress-bar anchor when not heating
+              id(boiler_pid).reset_integral_term();
+              id(calculated_power).publish_state(${base_power_w}f);   // base (controller) consumption only
+              return 0.0f;
+            }
+
+            float Tb_m  = id(boiler_temperature).state;   // the MEASURED boiler temp
+            bool tb_valid = !isnan(Tb_m) && !isinf(Tb_m);  // is there a valid measurement?
+
+            // MEASUREMENT-READY: until the first valid temperature sample has arrived
+            // (NaN/unknown on the sensor, until the first ADS1115+median sample), we do NOT
+            // heat. Typically only the first few seconds after power-on.
+            if (!id(measurement_ready) || !tb_valid) {
+              id(calculated_power).publish_state(${base_power_w}f);
+              return 0.0f;
+            }
+
+            float Tb    = Tb_m;                            // control works from the MEASURED Tb
+            float sp    = id(boiler_pid).target_temperature;
+            float Ts    = id(coil_Ts);                  // the coil's excess temperature [°C]
+            float P     = id(heating_power).state;      // heating power [°C/s]
+            float tau_coil = id(coil_tau).state;        // coil->boiler transfer time constant [s]
+            float tau_c = id(tau_cool).state;           // cooling time constant [s]
+            // T_amb: the boiler does not cool toward the ROOM but toward the inside of the
+            // machine housing — this is a model constant determined TOGETHER with the tau_cool fit
+            // (the 7751s belongs to the 25°C asymptote). It is NOT the room temperature, so it is not
+            // adjustable (matching it to room temperature would be misleading). Fixed constant.
+            const float T_amb = 25.0f;
+
+            // ---- 0) Control regime: SINGLE-MODE (model throttle throughout) ----
+            // There is no separate hold regulator. heating_mode is forced true (below), so
+            // ctrl is always 1.0 and the proportional throttle (section 2) regulates the
+            // boiler in BOTH heatup and hold, purely on the two-state model. Around the
+            // setpoint the projection heats just enough for the peak to land on sp, which at
+            // equilibrium is exactly the loss-replacement level, so the same throttle holds.
+            bool was_heating = id(heating_mode);
+            id(heating_mode) = true;       // single-mode: proportional throttle throughout
+            bool heating = id(heating_mode);
+            // Defensive integrator clear if the mode ever changes (it doesn't in single-mode);
+            // keeps the unused climate shell's internal state clean.
+            if (heating != was_heating) {
+              id(boiler_pid).reset_integral_term();
+            }
+
+            // signal fed to the limiter (always 1.0 in single-mode)
+            float ctrl = heating ? 1.0f : state;
+
+            // ---- 1) PROJECTION and DEAD TIME — the basis of proportional throttling ----
+            // The FREE DECAY of the explicit two-state model: starting from a given Ts and
+            // the real Tb, with u=0 the boiler creeps up to its peak (until the delivery
+            // Ts/tau_coil and the cooling (Tb-T_amb)/tau_c balance out). This is the real
+            // peak with 0.88°C RMSE.
+            //
+            // DEAD TIME (lookahead, embedded in the proportional throttle). For short
+            // (near, high-starting-temp) heatups the DOMINANT cause of overshoot is NOT the
+            // coil model, but the TEMPERATURE SENSOR PHASE LAG: the voltage_sensor's median
+            // filter (window_size=5, 500ms sample = 2.5s window) follows the real boiler
+            // temp on a rising ramp ~1-2s LATE and UNDERESTIMATED. The data from run 28
+            // showed this: during the 13s burst the measured Tb stayed "flat" at ~85, then
+            // AFTER the burst jumped to 91.6 — the projection started from the delayed,
+            // under-read Tb, so it underestimated and throttled late (+2°C). The throttle
+            // projection therefore steps Ts FORWARD by the lookahead with the candidate u
+            // (see proj_for_u below): this compensates the median under-reading. The median
+            // phase lag is the MIDDLE of the WINDOW (~1.25s). From cold the lag is negligible
+            // compared to the multi-minute heatup.
+            // the proj_for_u lambda. (The diagnostic "Projected peak" sensor is computed and
+            // published separately, lookahead-free, at the start of write_action.)
+
+            // ---- 2) THROTTLE and HARD LIMIT (mode-dependent, clean separation) ----
+            //
+            // BURST MODE (heatup): PROPORTIONAL predictive throttle. Instead of bang-bang
+            //   (proj>sp -> 0, else 1) we search for the heating level u (0..1) for which the
+            //   PROJECTED peak is exactly the TARGET (sp minus the momentum offset, see
+            //   below). This way the coil charges EXACTLY enough for the boiler to creep to
+            //   the target — not too much (no over-charge/overshoot), not too little (no
+            //   abrupt stop -> no getting stuck below sp). The bang-bang's sudden 1->0 jump
+            //   is replaced by a SMOOTH, continuous transition: as the boiler approaches,
+            //   u falls from 1 to 0. Getting stuck below sp is prevented by the offset
+            //   decaying to 0 as the climb flattens (the target returns to sp itself).
+            //   The projection is u-dependent: the lookahead Ts charges with u,
+            //   monotone -> binary search. Hard limit = sp: if the boiler does reach the
+            //   setpoint, heating is 0.
+            //
+            // The throttle target peak: sp MINUS a MOMENTUM (lag) offset. The projection
+            // works from the MEASURED Tb, which lags the true boiler state (sensor mass +
+            // filtering): on a rising ramp the displayed temp is LOW by (lag * heating
+            // rate), so the projection underestimates the coming peak by the same amount.
+            // Fitted on two cold-start logs (06-08, 06-09): the peak underestimate tracks
+            // dTb/dt with tau_lag = 17-20 s (RMSE 0.18 over both days), and the hold data
+            // confirms ~0 error where dTb/dt ~ 0. So the offset is rate-driven: it vanishes
+            // in hold BY CONSTRUCTION (the hold sits exactly on sp), and only bites while
+            // the boiler is actually climbing (cold heatup, shot recovery) -> the approach
+            // arrives from below, overshoot-free. (A static offset(Ts) curve cannot do
+            // this: the error is PATH-dependent — at the same Ts~1 it is ~0.7°C right
+            // after a steep climb and ~0 in quiet hold.)
+            // HA-tunable parameters ("Offset tau_lag", "Offset cap"); fitted defaults
+            // tau_lag = 20 s (fit range 17-20, conservative end), cap = 2.5 °C (~1.3x the
+            // max observed need of ~1.9). The rate-EMA window is tied to tau_lag (alpha =
+            // 1/tau_lag), so the fitted (window, tau) pair stays consistent when tuned.
+            // Setting "Offset tau_lag" to 0 disables the offset entirely.
+            const float off_tau = id(off_tau_lag).state;            // s
+            const float off_alpha = (off_tau > 1.0f) ? (1.0f / off_tau) : 1.0f;
+            if (id(prev_tb) > 0.0f) {
+              float rate = Tb - id(prev_tb);                        // °C/s (dt = 1 s)
+              id(tb_rate_ema) += off_alpha * (rate - id(tb_rate_ema));
+            }
+            id(prev_tb) = Tb;
+            float offset = off_tau * fmaxf(id(tb_rate_ema), 0.0f);
+            if (offset > id(off_cap).state) offset = id(off_cap).state;
+            const float target = sp - offset;   // momentum-corrected target peak
+            float out = ctrl;
+            if (heating) {
+              // The proportional throttle projects from the MEASURED Tb, with an adjustable
+              // LOOKAHEAD. The sensor (median + NTC inertia) delays the measured Tb, so a
+              // projection from the measured value computes from a stale state -> it throttles
+              // late at the end of a steep heatup -> overshoot. The lookahead compensates:
+              // before the projection it steps Ts AND Tb forward by 'lookahead_s' seconds
+              // with the candidate u — it projects from the FUTURE (sensor-lag-corrected)
+              // state, so it reaches the target earlier and throttles earlier. A single,
+              // physically motivated, adjustable parameter (the sensor lag ~ the median window
+              // center + inertia, initial 2.5s; tunable on a real heatup). lookahead_s=0 ->
+              // no compensation.
+              float la = id(lookahead_s).state;
+              auto proj_for_u = [&](float u) -> float {
+                float ts = Ts; float tb = Tb;            // starts from the MEASURED Tb
+                // 1) LOOKAHEAD: 'la' seconds of forward simulation with the candidate u
+                //    (with a fractional last step, so a fractional la is also exact)
+                float rem = la;
+                while (rem > 0.001f) {
+                  float dt = (rem > 1.0f) ? 1.0f : rem;
+                  float dtb = (ts / tau_coil - (tb - T_amb) / tau_c) * dt;
+                  ts += (P * u - ts / tau_coil) * dt;
+                  if (ts < 0.0f) ts = 0.0f;
+                  tb += dtb;
+                  rem -= dt;
+                }
+                // 2) FREE DECAY (u=0) to the peak — the coil delivers the remainder
+                float pk = tb;
+                for (int i = 0; i < 600; i++) {
+                  float dtb = ts / tau_coil - (tb - T_amb) / tau_c;
+                  ts += -ts / tau_coil; tb += dtb;
+                  if (tb > pk) pk = tb;
+                  if (ts < 0.01f) break;
+                }
+                return pk;
+              };
+              if (proj_for_u(0.0f) >= target) {
+                out = 0.0f;             // even the residual coil overshoots -> full throttle
+              } else if (proj_for_u(1.0f) <= target) {
+                out = 1.0f;             // even at full power it won't reach the target -> full heat
+              } else {
+                // in between: binary search for the u where proj(u) = target (monotone)
+                float lo = 0.0f, hi = 1.0f;
+                for (int it = 0; it < 16; it++) {
+                  float mid = 0.5f * (lo + hi);
+                  if (proj_for_u(mid) < target) lo = mid; else hi = mid;
+                }
+                out = 0.5f * (lo + hi);
+              }
+              out = fmaxf(0.0f, fminf(1.0f, out));
+              // The 'Tb >= sp -> 0' hard limit is intentionally NOT applied: the proportional
+              // throttle must regulate AROUND sp (heat below target, throttle above), and a
+              // hard cut would prevent loss replacement -> the boiler would drift below sp.
+              // Overshoot is prevented by the throttle itself. The absolute max-temp emergency
+              // stop (below, 110°C) STAYS.
+            }
+
+            // ---- 3b) safety max-temp protection (the existing absolute emergency stop) ----
+            if (Tb >= id(boiler_max_safe_temp).state) {
+              out = 0.0f;
+            }
+
+            // ---- 3c) error-diffusion quantization to whole % ----
+            // Whole-% output with the remainder FED BACK into the next cycle (error
+            // feedback / dithering): every cycle we output a whole %, BUT the long-term
+            // average stays exactly the demand. With ledc (high-res PWM) the rounding is
+            // cosmetic; it mainly matters on an integral-cycle SSR where 1% = 1 mains
+            // half-cycle. Harmless here, kept for parity with the model.
+            // If the protection set 0, we do NOT diffuse (the hardware forbids heating).
+            if (out <= 0.0f) {
+              id(quant_error) = 0.0f;                   // protection active: nothing to carry
+            } else {
+              float desired = out + id(quant_error);    // desired + previous remainder
+              float q = roundf(desired * 100.0f) / 100.0f;  // to whole % (= whole half-cycle)
+              id(quant_error) = desired - q;            // carry the remainder
+              out = fmaxf(0.0f, fminf(1.0f, q));        // whole-% output
+            }
+
+            // ---- 4) store the ACTUALLY applied level (the interval integrates this) ----
+            id(last_heater_level) = out;
+
+            // ---- 4a-ETA) ESTIMATED TIME to reach the setpoint ----
+            // How long until the boiler reaches the setpoint, simulated as a CLOSED LOOP:
+            // each step we apply the SAME proportional predictive throttle the controller
+            // uses (binary-search the level u whose projected peak hits sp, with the
+            // lookahead), not a naive 100% heat. The controller throttles down hard well
+            // before sp to avoid overshoot, so the real approach is far slower than full
+            // power; an open-loop 100% sim was ~2x optimistic (e.g. 117 s vs a real ~223 s).
+            // This version reproduces the throttle-down and lands within a few % of reality.
+            // We report -1 ("arrived") once within a small band of sp (holding), so the
+            // readout doesn't show a spurious value at temperature.
+            //
+            // The free-decay peak inside the throttle search is approximated analytically
+            // (the coil delivers ~all of its stored heat to Tb, minus a little cooling),
+            // which keeps the nested search cheap enough to run every cycle.
+            {
+              const float eta_ready_band = 0.5f;   // within this of sp -> "arrived" (-1)
+              if (Tb >= sp - eta_ready_band) {
+                id(eta_to_sp_val) = -1.0f;
+              } else {
+                float la = id(lookahead_s).state;
+                // projected free-decay peak for candidate level u, from (ts,tb)
+                auto pk_e = [&](float ts, float tb, float u) -> float {
+                  float rem = la;                              // lookahead with u
+                  while (rem > 0.001f) {
+                    float dt = (rem > 1.0f) ? 1.0f : rem;
+                    float dtb = (ts / tau_coil - (tb - T_amb) / tau_c) * dt;
+                    ts += (P * u - ts / tau_coil) * dt;
+                    if (ts < 0.0f) ts = 0.0f;
+                    tb += dtb; rem -= dt;
+                  }
+                  // analytic peak: coil delivers ~all of ts, minus cooling over ~1.6*tau_coil
+                  float loss = ((tb + ts * 0.5f) - T_amb) / tau_c * (tau_coil * 1.6f);
+                  return tb + ts - loss;
+                };
+                float ts_e = Ts; float tb_e = Tb; int secs = 0;
+                for (int i = 0; i < 3600; i++) {          // cap 1 h
+                  // the throttle level the controller would apply now (target = sp)
+                  float u;
+                  if (pk_e(ts_e, tb_e, 0.0f) >= sp) u = 0.0f;
+                  else if (pk_e(ts_e, tb_e, 1.0f) <= sp) u = 1.0f;
+                  else {
+                    float lo = 0.0f, hi = 1.0f;
+                    for (int it = 0; it < 10; it++) {
+                      float mid = 0.5f * (lo + hi);
+                      if (pk_e(ts_e, tb_e, mid) < sp) lo = mid; else hi = mid;
+                    }
+                    u = 0.5f * (lo + hi);
+                  }
+                  ts_e += P * u - ts_e / tau_coil;
+                  if (ts_e < 0.0f) ts_e = 0.0f;
+                  tb_e += ts_e / tau_coil - (tb_e - T_amb) / tau_c;
+                  secs = i + 1;
+                  if (tb_e >= sp - eta_ready_band) break;
+                }
+                id(eta_to_sp_val) = (float)secs;
+              }
+            }
+
+            // Progress-bar anchor: mark when the heatup began (ETA active), clear on arrival.
+            // The bar uses progress = elapsed / (elapsed + ETA), which is self-normalizing.
+            if (id(eta_to_sp_val) > 0.5f) {
+              if (id(heatup_start) == 0) id(heatup_start) = millis();
+            } else {
+              id(heatup_start) = 0;
+            }
+
+            // ---- 4b) STABILITY detection (PHYSICAL condition, INDEPENDENT of control mode) ----
+            // Stable = the boiler is near the setpoint (|Tb-sp| < 0.3°C) AND there is little
+            // heat in transit that would carry it away (Ts < 3.0°C) AND this holds for >=30s.
+            // We do NOT tie it to the control mode (heating_mode): that only says HOW we
+            // regulate, not whether the boiler is physically ready. In the model-based trial
+            // heating_mode is true throughout, so the old '!heating' condition was NEVER
+            // satisfied -> 'stable' never became true, even though the boiler held perfectly.
+            // The Ts threshold is 3.0 (not 0.3): in hold the feed-forward replaces the loss,
+            // so there is a CONSTANT ~2°C of heat in transit (measured: 1.6-2.4) — this is the normal
+            // hold state, NOT instability. During heatup and the overshoot decay Ts is much
+            // larger (~10-24), so the 3.0 threshold cleanly separates the 'ready' hold from
+            // the 'still moving' heatup.
+            bool stable_cond = fabsf(Tb - sp) < 0.3f && Ts < 3.0f;
+            uint32_t now_ms = millis();
+            if (stable_cond) {
+              if (id(stable_since) == 0) id(stable_since) = now_ms;
+              else if (now_ms - id(stable_since) >= 30000) id(stable) = true;
+            } else {
+              id(stable_since) = 0;
+              id(stable) = false;
+            }
+
+            // ---- 5) update power consumption HERE, from the actual (limited) out ----
+            // Here, where the real output is produced (after limiting).
+            // out: 0..1 scale, so NO /100. +base_power_w is the base consumption (control).
+            id(calculated_power).publish_state(out * id(device_power).state + ${base_power_w}f);
+
+            return out;
+
+number:
+  - platform: template
+    id: "device_power"
+    name: "Power"
+    icon: "mdi:power-socket-de"
+    initial_value: ${device_power_w}
+    min_value: 100
+    max_value: 2000
+    unit_of_measurement: 'W'
+    optimistic: true
+    restore_value: true
+    step: 10
+    entity_category: CONFIG
+  - platform: template
+    id: "boiler_max_safe_temp"
+    name: "Boiler max safe temperature"
+    icon: "mdi:temperature-alert"
+    initial_value: ${max_safe_temp_c}
+    min_value: 70.0
+    max_value: 150.0
+    unit_of_measurement: 'C'
+    optimistic: true
+    restore_value: true
+    step: 1.0
+    entity_category: CONFIG
+
+  # ENERGY-BALANCE CONTROLLER — PHYSICAL parameters tunable from HA. First-boot
+  # defaults come from the device substitutions; the overnight tune and the daily
+  # adaptive overwrite them at runtime (restore_value keeps the tuned values).
+  - platform: template
+    name: "Heating power (P)"                # P: heating power in the two-state model [C/s]
+    id: heating_power
+    min_value: 0.1
+    max_value: 2.0
+    step: 0.001
+    initial_value: ${default_heating_power}  # EFFECTIVE full-curve P (not the bare ramp slope)
+    unit_of_measurement: "°C/s"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+  - platform: template
+    name: "Coil time constant (tau_coil)"    # coil->boiler transfer time constant [s]
+    id: coil_tau
+    min_value: 5.0
+    max_value: 120.0
+    step: 0.5
+    initial_value: ${default_coil_tau}       # EFFECTIVE full heatup dynamics (not the decay value)
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+  - platform: template
+    name: "Throttle lookahead"               # projection lookahead [s] = sensor lag (median + NTC)
+    id: lookahead_s
+    min_value: 0.0
+    max_value: 15.0
+    step: 0.5
+    initial_value: ${default_lookahead_s}    # 0 = no compensation; also used as L in the tune fit
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+  - platform: template
+    name: "Offset tau_lag"                   # momentum offset = tau_lag * max(dTb/dt EMA, 0) [s]
+    id: off_tau_lag
+    min_value: 0.0
+    max_value: 60.0
+    step: 0.5
+    initial_value: ${default_off_tau_lag}    # ~0 in hold by construction; 0 = offset disabled
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+  - platform: template
+    name: "Offset cap"                       # clamp on the momentum offset [C] (rate-spike guard)
+    id: off_cap
+    min_value: 0.0
+    max_value: 10.0
+    step: 0.1
+    initial_value: ${default_off_cap}
+    unit_of_measurement: "°C"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+  - platform: template
+    name: "Cooling time constant (tau_cool)" # boiler free-cooling time constant [s]
+    id: tau_cool
+    min_value: 200.0
+    max_value: 15000.0
+    step: 50.0
+    initial_value: ${default_tau_cool}
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+sensor:
+  - platform: template
+    name: "Power consumption"
+    id: calculated_power
+    unit_of_measurement: W
+  - platform: total_daily_energy
+    power_id: calculated_power
+    name: 'Total Daily Energy'
+    unit_of_measurement: 'Wh'
+    state_class: total_increasing
+    device_class: energy
+    accuracy_decimals: 3
+  - platform: internal_temperature
+    id: "int_temp"
+    name: "Internal temperature"
+  - platform: wifi_signal # Reports the WiFi signal strength (RSSI) in dB
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+  - platform: uptime
+    name: Uptime Sensor
+
+  # ---- compute / memory headroom diagnostics ----
+  # Loop time: the main loop targets ~16 ms per iteration; the reported value is
+  # the MAX over the update window, so the 1 s controller math (projections,
+  # binary search, ETA sim) shows up as its worst-case cost. Headroom = 16 ms
+  # minus this. Heap free / max block: memory reserve and fragmentation.
+  - platform: debug
+    free:
+      name: "Heap free"
+      entity_category: "diagnostic"
+    block:
+      name: "Heap max block"
+      entity_category: "diagnostic"
+    loop_time:
+      name: "Loop time"
+      entity_category: "diagnostic"
+    cpu_frequency:
+      name: "CPU frequency"
+      entity_category: "diagnostic"
+
+  # =====================================================================
+  #  ENERGY-BALANCE CONTROLLER — diagnostic sensors
+  #  These are PASSIVE — no own lambda and no update_interval. The coil-state's
+  #  per-write_action update (where Ts is also updated) publishes them DIRECTLY
+  #  (publish_state), in a single beat with Ts. So there is no separate/drifting
+  #  update, and they also update correctly in OFF mode (during decay).
+  # =====================================================================
+  - platform: template
+    name: "Coil heat in transit"   # the coil's excess temperature (°C) it will STILL deliver
+    id: coil_energy_sensor
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    name: "Projected peak"         # "if I set the output to 0 now, where is the peak"
+    id: projected_peak_sensor
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+  - platform: template
+    name: "Time to setpoint"       # estimated time [s] to reach the setpoint at full heat.
+    id: eta_to_sp_sensor           # smooth monotonic countdown; -1 = at/near the setpoint
+    unit_of_measurement: "s"       # (arrived/holding).
+    accuracy_decimals: 0
+  - platform: template
+    # This is the REAL output: the level actually going to heating (from last_heater_level,
+    # AFTER limiting), in 0-100%. Look at this for hold/heatup diagnostics.
+    name: "Output (%)"
+    id: actual_heater_level_sensor
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: 'return id(last_heater_level) * 100.0;'
+
+text_sensor:
+  - platform: template
+    name: "Auto-tune status"
+    id: autotune_status
+    icon: "mdi:tune-variant"
+    update_interval: 2s
+    lambda: 'return id(tune_msg);'
+  - platform: template
+    name: "Control mode"           # the boiler's regime: HEATUP (ramping to sp) vs HOLD (at/around
+                                   # sp). Separate from the 'stable' readiness flag (the ready cup).
+    id: control_mode
+    icon: "mdi:state-machine"
+    update_interval: 2s
+    lambda: |-
+      // There is ONE regulator (the model throttle) in both regimes; heating_mode is
+      // intentionally forced true throughout (single-mode control). This label therefore
+      // just DESCRIBES the boiler's situation, derived from the ETA: ramping to sp
+      // (HEATUP) vs arrived / regulating around sp (HOLD). Tuning overrides everything.
+      if (id(tune_phase) > 0) return std::string("AUTO-TUNE");
+      return (id(eta_to_sp_val) > 0.5f) ? std::string("HEATUP")
+                                        : std::string("HOLD");
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+    ssid:
+      name: SSID
+    bssid:
+      name: ESP Connected BSSID
+    mac_address:
+      name: Mac Address
+    dns_address:
+      name: DNS Address
+    
+  
+climate:
+  - platform: pid
+    name: "Boiler controller"
+    sensor: boiler_temperature
+    default_target_temperature: 91°C
+    id: boiler_pid
+#    mode: OFF
+    heat_output: pid_output
+    visual:
+      min_temperature: 80
+      max_temperature: 120
+      temperature_step: 0.1 
+
+    control_parameters:
+      # NOTE: the climate's raw output is NOT used. The heater is driven entirely by the
+      # model-based proportional throttle in the `pid_output` write_action (which
+      # ignores the climate `state`). This climate component exists only as the
+      # trigger (it calls write_action on every temperature sample), the setpoint
+      # holder (target_temperature), the on/off switch (HEAT/OFF mode), and the HA
+      # thermostat card. These gains are required by the platform but are inactive.
+      kp: 0.119
+      ki: 0.00034
+      kd: 2.5
+      output_averaging_samples: 8
+      derivative_averaging_samples: 15
+      max_integral: 0.12
+      min_integral: -1.0
+      
+switch:
+  # ADAPTIVE DAILY TUNE: when ON, every clean COLD heatup (Tb < 45C at start —
+  # typically the first one in the morning) is observed, and afterwards the SAME
+  # full-curve 3D fit runs on the recorded closed-loop (Tb, u) traces as in the
+  # overnight tune. P, tau_coil and lookahead_s are corrected with a gentle 30%
+  # EMA blend (a single odd morning cannot drag the model far); off_tau_lag comes
+  # from the verification-style regression. tau_cool is not touched: it needs the
+  # long cooling experiment (overnight tune).
+  - platform: template
+    name: "Adaptive tune (daily)"
+    id: adaptive_tune
+    icon: "mdi:tune"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: CONFIG
+
+button:
+  - platform: template
+    name: "Auto-tune (full, overnight)"
+    icon: "mdi:tune-variant"
+    on_press:
+      # Climate to OFF (steps aside) and the OVERNIGHT machine starts from phase 1.
+      # It measures AND WRITES heating_power, coil_tau, tau_cool and off_tau_lag itself,
+      # then leaves the machine in HEAT holding sp. MULTI-HOUR sequence (~5-6 h from a
+      # warm evening machine; the first cycle waits for <35C). ABORT any time.
+      - lambda: |-
+          auto call = id(boiler_pid).make_call();
+          call.set_mode("OFF");
+          call.perform();
+          id(adapt_phase) = 0;       // stop the adaptive observer if it was mid-heatup
+          id(tune_phase) = 1;
+          id(tune_cycle) = 1;        // first cycle
+          id(tune_t0) = millis();
+          id(tune_hist_t) = 0;       // reset the trend history
+          id(tune_hist_temp) = 0.0f;
+          id(tune_buf_n) = 0;        // reset the measurement state
+          id(tune_cool_n) = 0;
+          id(tune_cool_prev_ms) = 0;
+          for (int c = 0; c < 4; c++) { id(tune_P)[c] = 0.0f; id(tune_TC)[c] = 0.0f; }
+          id(tune_msg) = "C1 P1: overnight tune started, waiting for a cold (<35C) start";
+  - platform: template
+    name: "Auto-tune ABORT"
+    icon: "mdi:cancel"
+    on_press:
+      # Stops tuning but LEAVES the climate in OFF — the user decides when and how to restart
+      # it (to hold or to a new tuning). It does not turn on by itself at an unwanted moment.
+      # Heating stays 0 (the tuning lambda no longer runs, write_action gives 0 in OFF mode).
+      - lambda: |-
+          id(tune_phase) = 0;
+          id(adapt_phase) = 0;
+          id(tune_msg) = "aborted (PID stays OFF)";
+          id(heater).set_level(0.0f);
+          id(last_heater_level) = 0.0f;
+debug:
+  update_interval: 5s
+
+# Enable Home Assistant API
+time:
+  - platform: homeassistant
+    id: esptime
+
+# Enable logging
+interval:
+  - interval: 1s
+    then:
+      # ===== OVERNIGHT AUTO-TUNE — full ON-DEVICE identification + entity writes =====
+      # The machine measures everything itself and WRITES the HA number entities:
+      #   tau_cool    <- two-point pairs on the cooling phases (5-min snapshots, 95..45C band)
+      #   P, tau_coil, lookahead_s <- FULL-CURVE 3D grid fit on the recorded cycle trace
+      #                  (ramp + coast + peak together; P x tau_coil x sensor-lag L) —
+      #                  the same EFFECTIVE parameters the offline manual fit gives.
+      #                  The fit identifies P and the POLE PAIR {a,b}; the sensor/coil
+      #                  split is NOT identifiable (swap-symmetric), so it is made by a
+      #                  deterministic safety rule: L = min(a, (a+b)/3), tc = a+b-L
+      #                  (under-split only slows, over-split overshoots). Point
+      #                  estimators (ramp slope, peak, rate ratios) each catch a
+      #                  different corner of the model error on the stratifying boiler
+      #                  (P: 0.81 ramp / 0.97 peak / 0.72-0.78 full curve); the
+      #                  controller needs the full-curve values, and P is insensitive
+      #                  to the L assumption.
+      #   off_tau_lag <- accumulator regression (err vs dTb/dt) on the final CONTROLLED
+      #                  verification heatup — the OPERATIONAL lag, projection error included.
+      #                  (A hard-cut cycle would measure only the ~3s pure sensor lag — wrong qty.)
+      # The fit code was validated end-to-end: the exact C++ logic compiled on the real C2
+      # trace gives P=0.78, tau_coil=18.0 — matching the python/scipy full-curve reference.
+      # PHASES: 1 wait for COLD start (<35C and not warming) -> 2 heat 100%% to 80C ->
+      #   3 coast (trace recording) -> 4 cool to 50C (fit + tau_cool pairs) -> next cycle (3x) ->
+      #   5 cool to 75C -> write plant params, climate HEAT -> 6 verification heatup under
+      #   the NORMAL controller (the write_action guard lets phase 6 through) ->
+      #   write off_tau_lag -> DONE (the machine keeps holding sp for the morning).
+      # Timeouts on every phase; sensor-NaN or near-max-temp aborts immediately.
+      - lambda: |-
+          float Tb  = id(boiler_temperature).state;
+          uint32_t now = millis();
+          char buf[200];
+          int ph = id(tune_phase);
+
+          // 1 Hz ring buffer of Tb + regression-slope helper (the only primitives the
+          // estimators need; W+1 samples, slope in °C/s). Maintained ALWAYS — both the
+          // tune machine and the adaptive observer read it. NaN samples are skipped.
+          if (!isnan(Tb)) {
+            id(tune_buf_i) = (id(tune_buf_i) + 1) % 24;
+            id(tune_buf)[id(tune_buf_i)] = Tb;
+            if (id(tune_buf_n) < 24) id(tune_buf_n) = id(tune_buf_n) + 1;
+          }
+          auto slopeW = [&](int W) -> float {
+            if (id(tune_buf_n) < W + 1) return NAN;
+            float n = 0, Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+            for (int k = 0; k <= W; k++) {
+              float y = id(tune_buf)[(id(tune_buf_i) - (W - k) + 48) % 24];
+              n += 1; Sx += k; Sy += y; Sxx += (float)k * k; Sxy += (float)k * y;
+            }
+            return (n * Sxy - Sx * Sy) / (n * Sxx - Sx * Sx);
+          };
+          // median of n floats (insertion sort, n <= 8)
+          auto medN = [&](float *v, int n) -> float {
+            for (int i = 1; i < n; i++) { float x = v[i]; int j = i - 1;
+              while (j >= 0 && v[j] > x) { v[j+1] = v[j]; j--; } v[j+1] = x; }
+            return (n == 0) ? NAN : ((n % 2) ? v[n/2] : 0.5f * (v[n/2-1] + v[n/2]));
+          };
+          const float TAMB = 25.0f;
+          float taucool_ref = id(tau_cool).state;   // loss correction (tiny term; the
+                                                    // entity's current value is fine)
+
+          // ===== ADAPTIVE DAILY CORRECTION (tune inactive, switch-gated) =====
+          // Observes a clean COLD heatup under the NORMAL controller, then runs the SAME
+          // full-curve 3D grid fit as the overnight tune on the recorded traces. The
+          // morning heatup is CLOSED-LOOP (u varies continuously), so the fit simulates
+          // with the RECORDED u instead of the tune's step input — the estimator itself
+          // is excitation-agnostic. Results are blended GENTLY (30% EMA) into P,
+          // tau_coil and lookahead_s; off_tau_lag comes from the same regression as
+          // tune phase 6. Cold gate Tb<45C -> effectively the first (morning) heatup;
+          // shot recoveries start hot and are skipped. tau_cool still needs the long
+          // cooling experiment — untouched here.
+          if (ph == 0) {
+            int ap = id(adapt_phase);
+            bool sw = id(adaptive_tune).state;
+            bool heat_on = (id(boiler_pid).mode == climate::CLIMATE_MODE_HEAT);
+            if (ap == 0) {
+              if (sw && heat_on && id(measurement_ready) && !isnan(Tb) && Tb < 45.0f
+                  && id(eta_to_sp_val) > 0.5f
+                  && id(boiler_pid).target_temperature - Tb > 20.0f) {
+                id(adapt_phase) = 1;
+                id(adapt_t0) = now;
+                id(tune_Sr) = 0.0f; id(tune_Srr) = 0.0f; id(tune_Srp) = 0.0f; id(tune_Sn) = 0;
+                id(tune_vpeak) = Tb;
+                id(tune_vsp) = id(boiler_pid).target_temperature;
+                id(tune_trace_n) = 0;
+                id(adapt_ts0) = id(coil_Ts);  // the heatup may be a few seconds old already
+                id(tune_msg) = "ADAPT: observing the cold heatup";
+              }
+              return;
+            }
+            if (ap == 1) {
+              // observing: record (Tb, u) and accumulate the off_tau_lag regression
+              uint32_t ael = (now - id(adapt_t0)) / 1000;
+              bool sp_moved = fabsf(id(boiler_pid).target_temperature - id(tune_vsp)) > 0.5f;
+              if (!sw || !heat_on || isnan(Tb) || sp_moved || ael > ${adapt_observe_timeout_s}) {
+                id(adapt_phase) = 0;
+                id(tune_msg) = "ADAPT: cancelled (mode/setpoint change or timeout)";
+                return;
+              }
+              if (Tb > id(tune_vpeak)) id(tune_vpeak) = Tb;
+              if (id(tune_trace_n) < ${trace_len}) {
+                id(tune_trace)[id(tune_trace_n)]   = Tb;
+                id(adapt_utrace)[id(tune_trace_n)] = id(last_heater_level);
+                id(tune_trace_n) += 1;
+              }
+              float r = slopeW(20);
+              float proj = id(projected_peak_val);
+              if (!isnan(r) && r > 0.003f && proj > 40.0f) {
+                id(tune_Sr)  += r;
+                id(tune_Srr) += r * r;
+                id(tune_Srp) += r * proj;
+                id(tune_Sn)  = id(tune_Sn) + 1;
+              }
+              // peak passed (same condition as tune phase 6) -> write off_tau_lag
+              // (30% blend), then start the incremental fit
+              bool peaked = (id(tune_vpeak) >= id(tune_vsp) - 1.0f) && (id(tune_vpeak) - Tb >= 0.2f);
+              if (!peaked) return;
+              if (id(tune_Sn) >= 60 && id(tune_Srr) > 0.0f) {
+                float tl = (id(tune_vpeak) * id(tune_Sr) - id(tune_Srp)) / id(tune_Srr);
+                if (tl >= 5.0f && tl <= 40.0f) {
+                  float nv = id(off_tau_lag).state + 0.3f * (tl - id(off_tau_lag).state);
+                  auto c = id(off_tau_lag).make_call(); c.set_value(nv); c.perform();
+                }
+              }
+              id(tune_fit_i) = 0;
+              id(tune_fit_bestC) = 1e30f;
+              id(adapt_phase) = 2;
+              snprintf(buf, sizeof(buf), "ADAPT: off_tau_lag=%.1f overshoot=%+.2fC, fitting the morning trace",
+                       id(off_tau_lag).state, id(tune_vpeak) - id(tune_vsp));
+              id(tune_msg) = std::string(buf);
+              return;
+            }
+            // ap == 2: incremental full-curve 3D fit on the recorded closed-loop traces
+            // (identical to the tune's fit, except u comes from adapt_utrace and the
+            // initial coil state from adapt_ts0); runs during the hold, 12 sims/tick
+            if (!sw || !heat_on) {
+              id(adapt_phase) = 0;
+              id(tune_msg) = "ADAPT: cancelled during the fit";
+              return;
+            }
+            if (id(tune_fit_i) < 3360) {
+              int nf = id(tune_trace_n);
+              for (int b2 = 0; b2 < 12 && id(tune_fit_i) < 3360; b2++) {
+                int i = id(tune_fit_i);
+                int j2 = i % 480;
+                float Lc = 4.0f + 2.0f * (i / 480);
+                if (j2 == 0) id(tune_fit_curC) = 1e30f;
+                float Pc, tcc;
+                if (j2 < 399) { Pc = 0.40f + 0.04f * (j2 / 19); tcc = 4.0f + 2.0f * (j2 % 19); }
+                else {
+                  if (j2 == 399) { id(tune_fit_cP) = id(tune_fit_curP); id(tune_fit_cTC) = id(tune_fit_curTC); }
+                  int j = j2 - 399;
+                  Pc  = id(tune_fit_cP) - 0.08f + 0.02f * (j / 9);
+                  tcc = id(tune_fit_cTC) - 4.0f + 1.0f * (j % 9);
+                  if (tcc < 3.0f) tcc = 3.0f;
+                }
+                float ts2 = id(adapt_ts0), tb2 = id(tune_trace)[0], tm2 = id(tune_trace)[0], cst = 0.0f;
+                for (int k = 1; k < nf; k++) {
+                  float uu2 = id(adapt_utrace)[k - 1];
+                  ts2 += Pc * uu2 - ts2 / tcc;
+                  if (ts2 < 0.0f) ts2 = 0.0f;
+                  tb2 += ts2 / tcc - (tb2 - TAMB) / taucool_ref;
+                  tm2 += (tb2 - tm2) / Lc;
+                  float d = id(tune_trace)[k] - tm2; cst += d * d;
+                }
+                if (cst < id(tune_fit_curC)) {
+                  id(tune_fit_curC) = cst; id(tune_fit_curP) = Pc; id(tune_fit_curTC) = tcc;
+                }
+                if (cst < id(tune_fit_bestC)) {
+                  id(tune_fit_bestC) = cst; id(tune_fit_bestP) = Pc;
+                  id(tune_fit_bestTC) = tcc; id(tune_fit_bestL) = Lc;
+                }
+                id(tune_fit_i) = i + 1;
+              }
+              if (id(tune_fit_i) < 3360) return;
+              // fit done: pole pair -> safety split -> gates -> 30% blend into the entities
+              int nf2 = id(tune_trace_n);
+              float rmse = sqrtf(id(tune_fit_bestC) / (float)(nf2 > 1 ? nf2 - 1 : 1));
+              float a   = fminf(id(tune_fit_bestTC), id(tune_fit_bestL));
+              float bp  = fmaxf(id(tune_fit_bestTC), id(tune_fit_bestL));
+              float S   = a + bp;
+              float Lw  = fminf(a, S / 3.0f);
+              float tcw = S - Lw;
+              float Pv  = id(tune_fit_bestP);
+              bool ok = (Pv > 0.1f && Pv < 2.0f && tcw >= 5.0f && tcw <= 120.0f
+                         && Lw >= 1.0f && Lw <= 15.0f && nf2 > 60 && rmse < 2.5f);
+              if (ok) {
+                float nP  = id(heating_power).state + 0.3f * (Pv  - id(heating_power).state);
+                float nTC = id(coil_tau).state      + 0.3f * (tcw - id(coil_tau).state);
+                float nL  = id(lookahead_s).state   + 0.3f * (Lw  - id(lookahead_s).state);
+                { auto c = id(heating_power).make_call(); c.set_value(nP);  c.perform(); }
+                { auto c = id(coil_tau).make_call();      c.set_value(nTC); c.perform(); }
+                { auto c = id(lookahead_s).make_call();   c.set_value(nL);  c.perform(); }
+                snprintf(buf, sizeof(buf), "ADAPT done: P=%.3f tc=%.1f L=%.1f off_tau_lag=%.1f (fit RMSE=%.2fC, 30%% blend)",
+                         nP, nTC, nL, id(off_tau_lag).state, rmse);
+              } else {
+                snprintf(buf, sizeof(buf), "ADAPT done: off_tau_lag=%.1f; fit rejected (RMSE=%.2fC) — P/tc/L unchanged",
+                         id(off_tau_lag).state, rmse);
+              }
+              id(tune_msg) = std::string(buf);
+              id(adapt_phase) = 0;
+            }
+            return;
+          }
+
+          // ===== OVERNIGHT TUNE MACHINE (ph > 0) =====
+          // SAFETY: sensor failure or approaching the absolute max -> heater off, abort
+          if (isnan(Tb) || Tb >= id(boiler_max_safe_temp).state - 2.0f) {
+            id(heater).set_level(0.0f);
+            id(last_heater_level) = 0.0f;
+            id(tune_phase) = 0;
+            id(tune_msg) = "ABORT: sensor failure or temperature too high";
+            return;
+          }
+
+          // climate-mode consistency: phases 1-5 need OFF (the machine drives the heater),
+          // phase 6 needs HEAT (the normal controller drives). Anything else = user
+          // intervention -> stop cleanly, nothing further is written.
+          bool clim_off = (id(boiler_pid).mode == climate::CLIMATE_MODE_OFF);
+          if (ph < 6 && !clim_off) {
+            id(tune_phase) = 0;
+            id(tune_msg) = "stopped: climate switched to HEAT during tuning";
+            return;
+          }
+          if (ph == 6 && clim_off) {
+            id(tune_phase) = 0;
+            id(tune_msg) = "stopped: climate switched to OFF during verification (off_tau_lag unchanged)";
+            return;
+          }
+
+          uint32_t elapsed = (now - id(tune_t0)) / 1000;
+
+          // ---- PHASE 1: wait for a COLD (<35C), no-longer-warming start ----
+          // The deep first cycle gives the longest t_on -> charge factor ~0.97 -> the most
+          // accurate P. Cycles 2-3 restart from 50C (phase 4), per the time/accuracy budget.
+          if (ph == 1) {
+            id(heater).set_level(0.0f);
+            id(last_heater_level) = 0.0f;
+            if (elapsed > 8 * 3600) {
+              id(tune_phase) = 0;
+              id(tune_msg) = "ABORT: did not cool below 35C within 8 hours";
+              return;
+            }
+            if (id(tune_hist_t) == 0 || (now - id(tune_hist_t)) >= 180000) {
+              float prev = id(tune_hist_temp); uint32_t prev_t = id(tune_hist_t);
+              id(tune_hist_temp) = Tb; id(tune_hist_t) = now;
+              if (prev_t != 0 && Tb < 35.0f && Tb <= prev + 0.05f) {
+                id(tune_phase) = 2; id(tune_t0) = now;
+                id(tune_trace_n) = 0;                       // a new cycle trace starts
+                id(heater).set_level(1.0f); id(last_heater_level) = 1.0f;
+                id(tune_msg) = "C1 P2: heating 100% (cut at 80C)";
+                return;
+              }
+            }
+            id(tune_msg) = "C1 P1: waiting for a cold start (<35C and not warming)";
+            return;
+          }
+
+          // ---- PHASE 2: 100% heating, SHARP cut at a fixed 80C ----
+          // At the cut we capture everything the estimators need: the 20s slope, Tb and t_on.
+          // (Fixed 80C: comparable cycles; the coast peaks at ~102-103C, the pressurized
+          //  tank is safe to 110-120C, max_safe_temp is the final net.)
+          if (ph == 2) {
+            if (elapsed > ${tune_heat_timeout_s}) {
+              id(heater).set_level(0.0f); id(last_heater_level) = 0.0f;
+              id(tune_phase) = 0;
+              id(tune_msg) = "ABORT: P2 timeout (80C not reached in time)";
+              return;
+            }
+            id(heater).set_level(1.0f); id(last_heater_level) = 1.0f;
+            if (id(tune_trace_n) < ${trace_len}) { id(tune_trace)[id(tune_trace_n)] = Tb; id(tune_trace_n) += 1; }
+            if (Tb >= 80.0f) {
+              id(tune_cut_slope) = slopeW(20);
+              id(tune_cut_tb)    = Tb;
+              id(tune_ton)       = (float)elapsed;
+              id(tune_peak)      = Tb;
+              id(tune_phase) = 3; id(tune_t0) = now;
+              id(heater).set_level(0.0f); id(last_heater_level) = 0.0f;
+              snprintf(buf, sizeof(buf), "C%d P3: cut at 80C (t_on=%.0fs), coast + trace", id(tune_cycle), id(tune_ton));
+              id(tune_msg) = std::string(buf);
+            } else {
+              snprintf(buf, sizeof(buf), "C%d P2: heating 100%% (cut at 80C)", id(tune_cycle));
+              id(tune_msg) = std::string(buf);
+            }
+            return;
+          }
+
+          // ---- PHASE 3: coast — record the trace; the FULL-CURVE fit replaces the old
+          // point estimators (rate ratios / lag-correction bisection). On the stratifying
+          // boiler the point estimators each catch a different corner of the model error
+          // (P: 0.81 from the ramp, 0.97 from the peak, 0.72-0.78 from the full curve);
+          // the controller needs the EFFECTIVE (whole-cycle) parameters — the same thing
+          // the offline manual fit computes. The fit itself runs incrementally during the
+          // cooling phase (12 sims/tick), so the loop is never blocked.
+          if (ph == 3) {
+            id(heater).set_level(0.0f); id(last_heater_level) = 0.0f;
+            if (id(tune_trace_n) < ${trace_len}) { id(tune_trace)[id(tune_trace_n)] = Tb; id(tune_trace_n) += 1; }
+            if (Tb > id(tune_peak)) id(tune_peak) = Tb;
+            // the coast is over once the peak is clearly passed (or on timeout); the
+            // 'fell 0.3C below the running max' condition only fires after a real peak,
+            // so the 60s gate is safe for slow plants too
+            bool peaked = (elapsed > 60) && (Tb <= id(tune_peak) - 0.3f);
+            if (peaked || elapsed > ${tune_coast_timeout_s}) {
+              id(tune_fit_i) = 0;            // start the incremental full-curve fit
+              id(tune_fit_bestC) = 1e30f;
+              id(tune_cool_prev_ms) = 0;     // restart the cooling-pair snapshots
+              id(tune_phase) = (id(tune_cycle) >= 3) ? 5 : 4;
+              id(tune_t0) = now;
+              snprintf(buf, sizeof(buf), "C%d P%d: cooling (peak was %.1fC), fitting the cycle trace",
+                       id(tune_cycle), (int)id(tune_phase), id(tune_peak));
+              id(tune_msg) = std::string(buf);
+            }
+            return;
+          }
+
+          // ---- PHASE 4/5: cooling; tau_cool pairs from 5-min snapshots (95..45C band) ----
+          // (5 min instead of the main machine's 30: the C3 rig cools with tau ~1000s,
+          //  a 30-min pair would fall out of the band before the second snapshot.)
+          // Phase 4 cools to 50C and starts the next cycle; phase 5 (after cycle 3) cools
+          // only to 75C, then finalizes the plant parameters and starts the verification.
+          if (ph == 4 || ph == 5) {
+            id(heater).set_level(0.0f); id(last_heater_level) = 0.0f;
+            // ---- incremental FULL-CURVE 3D grid fit (P x tau_coil x L) ----
+            // The trace identifies P and the POLE PAIR {a,b}; which pole is the sensor
+            // and which is the coil is NOT identifiable from data (the u->Tm transfer is
+            // swap-symmetric in the two), so the split is made by a deterministic SAFETY
+            // rule after the fit:
+            //   S = a+b;  L = min(smaller pole, S/3);  tau_coil = S - L
+            // Closed-loop sims: under-split (small L) only slows the approach,
+            // over-split overshoots; L = S/3 reproduces the empirically proven 9/18
+            // split on this rig (worst case +0.7C at +-5% plant scatter) and leaves the
+            // slow main-machine regime (min pole << S/3) unchanged.
+            // Grid: 7 L planes (4..16 step 2) x [P 0.40..1.20 /0.04 (21) x tc 4..40 /2
+            // (19) coarse + 9x9 refinement per plane] = 3360 sims, 12/tick -> ~4.7 min
+            // inside the cooling phase, never blocking the loop. Each sim integrates the
+            // two-state model AND the sensor lag, compared to the recorded MEASURED
+            // trace — exactly what the manual fit does.
+            if (id(tune_fit_i) < 3360) {
+              int nf = id(tune_trace_n);
+              int toni = (int)id(tune_ton);
+              for (int b2 = 0; b2 < 12 && id(tune_fit_i) < 3360; b2++) {
+                int i = id(tune_fit_i);
+                int j2 = i % 480;
+                float Lc = 4.0f + 2.0f * (i / 480);
+                if (j2 == 0) id(tune_fit_curC) = 1e30f;        // entering a new L plane
+                float Pc, tcc;
+                if (j2 < 399) { Pc = 0.40f + 0.04f * (j2 / 19); tcc = 4.0f + 2.0f * (j2 % 19); }
+                else {
+                  if (j2 == 399) { id(tune_fit_cP) = id(tune_fit_curP); id(tune_fit_cTC) = id(tune_fit_curTC); }
+                  int j = j2 - 399;
+                  Pc  = id(tune_fit_cP) - 0.08f + 0.02f * (j / 9);
+                  tcc = id(tune_fit_cTC) - 4.0f + 1.0f * (j % 9);
+                  if (tcc < 3.0f) tcc = 3.0f;
+                }
+                float ts2 = 0.0f, tb2 = id(tune_trace)[0], tm2 = id(tune_trace)[0], cst = 0.0f;
+                for (int k = 1; k < nf; k++) {
+                  float uu2 = (k < toni - 1) ? 1.0f : 0.0f;
+                  ts2 += Pc * uu2 - ts2 / tcc;
+                  tb2 += ts2 / tcc - (tb2 - TAMB) / taucool_ref;
+                  tm2 += (tb2 - tm2) / Lc;
+                  float d = id(tune_trace)[k] - tm2; cst += d * d;
+                }
+                if (cst < id(tune_fit_curC)) {
+                  id(tune_fit_curC) = cst; id(tune_fit_curP) = Pc; id(tune_fit_curTC) = tcc;
+                }
+                if (cst < id(tune_fit_bestC)) {
+                  id(tune_fit_bestC) = cst; id(tune_fit_bestP) = Pc;
+                  id(tune_fit_bestTC) = tcc; id(tune_fit_bestL) = Lc;
+                }
+                id(tune_fit_i) = i + 1;
+              }
+              if (id(tune_fit_i) >= 3360) {
+                // done: pole pair -> safety split -> validity gates -> store for the cycle
+                int c = id(tune_cycle);
+                float a   = fminf(id(tune_fit_bestTC), id(tune_fit_bestL));
+                float bp  = fmaxf(id(tune_fit_bestTC), id(tune_fit_bestL));
+                float S   = a + bp;
+                float Lw  = fminf(a, S / 3.0f);
+                float tcw = S - Lw;
+                float Pv  = id(tune_fit_bestP);
+                bool ok = (Pv > 0.1f && Pv < 2.0f && tcw >= 5.0f && tcw <= 120.0f
+                           && Lw >= 1.0f && Lw <= 15.0f && nf > 60);
+                id(tune_TC)[c] = ok ? tcw : 0.0f;
+                id(tune_P)[c]  = ok ? Pv  : 0.0f;
+                id(tune_L)[c]  = ok ? Lw  : 0.0f;
+              }
+            }
+            if (id(tune_cool_prev_ms) == 0) {
+              id(tune_cool_prev_ms) = now; id(tune_cool_prevT) = Tb;
+            } else if (now - id(tune_cool_prev_ms) >= 300000UL) {
+              float T1 = id(tune_cool_prevT), T2 = Tb;
+              if (T1 <= 95.0f && T2 >= 45.0f && T1 > T2 && T2 > TAMB + 5.0f) {
+                float tau = -300.0f / logf((T2 - TAMB) / (T1 - TAMB));
+                if (tau > 200.0f && tau < 15000.0f && id(tune_cool_n) < 8) {
+                  id(tune_cool_vals)[id(tune_cool_n)] = tau;
+                  id(tune_cool_n) = id(tune_cool_n) + 1;
+                }
+              }
+              id(tune_cool_prev_ms) = now; id(tune_cool_prevT) = Tb;
+            }
+            if (elapsed > 5 * 3600) {
+              id(tune_phase) = 0;
+              id(tune_msg) = "ABORT: cooling timeout (5 hours)";
+              return;
+            }
+            float goal = (ph == 4) ? 50.0f : 75.0f;
+            if (Tb > goal) {
+              if (id(tune_fit_i) < 3360) {
+                snprintf(buf, sizeof(buf), "C%d P%d: cooling to %.0fC, fitting the cycle trace", id(tune_cycle), ph, goal);
+              } else {
+                snprintf(buf, sizeof(buf), "C%d P%d: cooling to %.0fC (fit P=%.2f tc=%.1f L=%.1f RMSE=%.2fC; tau_cool pairs: %d)",
+                         id(tune_cycle), ph, goal, id(tune_P)[id(tune_cycle)], id(tune_TC)[id(tune_cycle)],
+                         id(tune_L)[id(tune_cycle)],
+                         sqrtf(id(tune_fit_bestC) / (float)(id(tune_trace_n) > 1 ? id(tune_trace_n) - 1 : 1)),
+                         id(tune_cool_n));
+              }
+              id(tune_msg) = std::string(buf);
+              return;
+            }
+            if (ph == 4) {
+              id(tune_cycle) = id(tune_cycle) + 1;
+              id(tune_phase) = 2; id(tune_t0) = now;
+              id(tune_trace_n) = 0;                         // a new cycle trace starts
+              id(heater).set_level(1.0f); id(last_heater_level) = 1.0f;
+              snprintf(buf, sizeof(buf), "C%d P2: heating 100%% (cut at 80C)", id(tune_cycle));
+              id(tune_msg) = std::string(buf);
+              return;
+            }
+            // ---- phase 5 finished cooling: finalize + WRITE plant params, then verify ----
+            // lookahead_s is written BEFORE the verification heatup, so phase 6 already
+            // runs (and regresses off_tau_lag) with the complete new parameter set.
+            float tcv[3], pv[3], lv[3]; int ntc = 0, np = 0, nl = 0;
+            for (int c = 1; c <= 3; c++) {
+              if (id(tune_TC)[c] > 0.0f) tcv[ntc++] = id(tune_TC)[c];
+              if (id(tune_P)[c]  > 0.0f) pv[np++]   = id(tune_P)[c];
+              if (id(tune_L)[c]  > 0.0f) lv[nl++]   = id(tune_L)[c];
+            }
+            if (ntc < 2 || np < 2 || nl < 2) {
+              id(tune_phase) = 0;
+              id(tune_msg) = "ABORT: too few valid cycles — no parameter was changed";
+              return;
+            }
+            float tc_med = medN(tcv, ntc);
+            float p_med  = medN(pv, np);
+            float l_med  = medN(lv, nl);
+            { auto c = id(coil_tau).make_call();      c.set_value(tc_med); c.perform(); }
+            { auto c = id(heating_power).make_call(); c.set_value(p_med);  c.perform(); }
+            { auto c = id(lookahead_s).make_call();   c.set_value(l_med);  c.perform(); }
+            if (id(tune_cool_n) >= 3) {
+              float cv[8];
+              for (int i = 0; i < id(tune_cool_n); i++) cv[i] = id(tune_cool_vals)[i];
+              float cm = medN(cv, id(tune_cool_n));
+              auto c = id(tau_cool).make_call(); c.set_value(cm); c.perform();
+            }
+            // verification heatup under the NORMAL controller: re-prime the momentum-offset
+            // rate estimator (it was idle during phases 1-5), zero the regression sums
+            id(prev_tb) = -1.0f; id(tb_rate_ema) = 0.0f;
+            id(tune_Sr) = 0.0f; id(tune_Srr) = 0.0f; id(tune_Srp) = 0.0f; id(tune_Sn) = 0;
+            id(tune_vpeak) = 0.0f;
+            id(tune_vsp) = id(boiler_pid).target_temperature;
+            { auto c = id(boiler_pid).make_call(); c.set_mode("HEAT"); c.perform(); }
+            id(tune_phase) = 6; id(tune_t0) = now;
+            snprintf(buf, sizeof(buf), "P6: P=%.3f tau_coil=%.1f lookahead=%.1f written (tau_cool pairs: %d), verification heatup", p_med, tc_med, l_med, id(tune_cool_n));
+            id(tune_msg) = std::string(buf);
+            return;
+          }
+
+          // ---- PHASE 6: verification heatup (normal control) -> off_tau_lag regression ----
+          // Accumulators: Sr, Srr, Srp over the climb (rate > 0.003); after the peak:
+          // tau_lag = (peak*Sr - Srp)/Srr — identical to the offline least-squares fit.
+          // The published projection is offset-independent, so the regressed value IS the
+          // parameter directly (validated: 24.7s regressed under an active 20s offset is
+          // consistent with that run's +0.29C overshoot).
+          if (ph == 6) {
+            if (Tb > id(tune_vpeak)) id(tune_vpeak) = Tb;
+            float r = slopeW(20);
+            float proj = id(projected_peak_val);
+            if (!isnan(r) && r > 0.003f && proj > 40.0f) {
+              id(tune_Sr)  += r;
+              id(tune_Srr) += r * r;
+              id(tune_Srp) += r * proj;
+              id(tune_Sn)  = id(tune_Sn) + 1;
+            }
+            bool peaked = (id(tune_vpeak) >= id(tune_vsp) - 1.0f) && (id(tune_vpeak) - Tb >= 0.2f);
+            bool tmo    = (elapsed > 900);
+            if (!peaked && !tmo) {
+              snprintf(buf, sizeof(buf), "P6: verification heatup to %.1fC under the normal controller", id(tune_vsp));
+              id(tune_msg) = std::string(buf);
+              return;
+            }
+            if (id(tune_Sn) >= 60 && id(tune_Srr) > 0.0f) {
+              float tl = (id(tune_vpeak) * id(tune_Sr) - id(tune_Srp)) / id(tune_Srr);
+              if (tl < 5.0f)  tl = 5.0f;
+              if (tl > 40.0f) tl = 40.0f;
+              { auto c = id(off_tau_lag).make_call(); c.set_value(tl); c.perform(); }
+              snprintf(buf, sizeof(buf), "AUTO-TUNE DONE: P=%.3f tau_coil=%.1f lookahead=%.1f tau_cool=%.0f off_tau_lag=%.1f overshoot=%+.2fC",
+                       id(heating_power).state, id(coil_tau).state, id(lookahead_s).state,
+                       id(tau_cool).state, tl, id(tune_vpeak) - id(tune_vsp));
+              id(tune_msg) = std::string(buf);
+            } else {
+              id(tune_msg) = "P6: not enough regression data — off_tau_lag unchanged, the rest written";
+            }
+            id(tune_phase) = 0;   // done; the climate stays in HEAT and holds sp
+            return;
+          }
+
+
+# =====================================================================
+#  ENERGY-BALANCE CONTROLLER — overview and tuning
+# =====================================================================
+#  Core idea: the boiler is modeled as two heat stores — the heating coil
+#  (Ts = excess heat still in transit to the boiler) and the boiler (Tb, what
+#  the sensor reads). Ts is built purely from the applied heating:
+#    dTs/dt = P*u - Ts/tau_coil
+#    dTb/dt = Ts/tau_coil - (Tb-T_amb)/tau_cool
+#  The throttle is PROPORTIONAL and PREDICTIVE: it searches for the heating
+#  level u whose PROJECTED peak (free decay of Ts together with the cooling
+#  loss) lands on the target. So the coil charges exactly enough for the boiler
+#  to creep to the target — no abrupt bang-bang, no getting stuck below sp.
+#
+#  Sensor lag is handled by a LOOKAHEAD (not a state observer — that was tried
+#  and dropped as fragile): before the projection, Ts and Tb are stepped forward
+#  by 'lookahead_s' seconds with the candidate u, so the projection works from
+#  the (lag-compensated) future state and throttles earlier.
+#
+#  The residual peak underestimate is a MOMENTUM (lag) error: the measured Tb
+#  lags the true boiler state, so on a rising ramp the projection misses by
+#  (lag * dTb/dt). Fitted on two cold-start logs: tau_lag = 17-20 s, ~0 in hold
+#  (the error is PATH-dependent — Ts alone cannot encode it).
+#  Compensation: target = sp - min(tau_lag * max(dTb/dt_EMA, 0), cap), where
+#  tau_lag ("Offset tau_lag", default 20 s) and cap ("Offset cap", default
+#  2.5°C) are HA-tunable. The rate-EMA window is tied to tau_lag. Rate-driven,
+#  so it vanishes in hold by construction (the hold sits exactly on sp); during
+#  climbs (cold heatup, shot recovery) it pulls the target down and the boiler
+#  arrives from below, overshoot-free. T_amb is burned in (25°C — the boiler
+#  cools toward the machine interior; not worth an entity).
+#
+#  TUNING (from HA, no reflash):
+#   1. Cold OVERSHOOT (>+0.5°C): raise "Offset tau_lag" (20 -> 25) and/or
+#      "Throttle lookahead" (2.5 -> 3.5). Both move the throttle earlier.
+#   2. UNDERSHOOT (boiler settles below sp, e.g. 89.3 instead of 89.6) or the
+#      final approach feels too slow: lower "Offset tau_lag" (20 -> 17) and/or
+#      "Throttle lookahead". With proportional throttling, hard under-stick is
+#      unlikely (it actively heats below the target, and the rate-offset
+#      decays to 0 as the climb flattens).
+#   3. The "Projected peak" sensor should approach the setpoint smoothly during
+#      heatup. The "Coil heat in transit" should peak around ~24°C at the end of
+#      a clean 100% step (matches the physical post-cutoff rise) and decay to
+#      ~2°C in hold (the loss-replacement level).
+#   4. Model parameters (P, tau_coil, tau_cool) are NOT hand-tuned — they are
+#      fitted from step-response data (see README and tools/fit_model.py).
+#
+#  KNOWN LIMITS:
+#   - After reboot Ts starts from 0; on a warm reboot the FIRST heatup may
+#     overshoot slightly until it rebuilds (max_safe_temp protects). Acceptable.
+#   - The two-state model uses a single tau_coil; the heatup and the free decay
+#     show slightly different effective values, so the peak projection has a
+#     small residual error — this is what the Ts-proportional offset absorbs.
+# =====================================================================
+

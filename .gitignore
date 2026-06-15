@@ -1,0 +1,4 @@
+# ESPHome build artifacts and secrets — never publish these
+.esphome/
+secrets.yaml
+*.bak

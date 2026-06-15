@@ -1,0 +1,94 @@
+# Example device config using the espresso boiler controller package.
+# ESP32 + ADS1115-read 10k NTC + SSR. Copy, adjust the hardware to your machine,
+# and put wifi_ssid / wifi_password / api_key / ota_password in secrets.yaml.
+
+substitutions:
+  # --- this machine's tuned values (the auto-tune overwrites these at runtime) ---
+  base_power_w: "1.7"            # idle draw [W]
+  device_power_w: "1450"        # heater power [W]
+  default_heating_power: "0.700"
+  default_coil_tau: "9.0"
+  default_lookahead_s: "9.0"
+  default_off_tau_lag: "11.9"
+  default_tau_cool: "3100.0"
+  # max_safe_temp, off_cap and the timeouts use the package defaults
+
+packages:
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@main
+
+esphome:
+  name: example-machine
+  friendly_name: Example Machine
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# --- temperature sensing: 10k NTC via an ADS1115 (I2C) ---
+i2c:
+  sda: 21
+  scl: 22
+  scan: true
+
+ads1115:
+  - address: 0x48
+    continuous_mode: false
+
+# --- the heater SSR: the package drives this `output` (id MUST be `heater`) ---
+output:
+  - platform: ledc          # use slow_pwm for a zero-cross (integral-cycle) SSR
+    frequency: 1Hz
+    channel: 0
+    id: heater
+    pin: 27
+
+# --- the temperature chain (the package needs the id `boiler_temperature`) ---
+sensor:
+  - platform: ntc
+    sensor: resistance_sensor
+    calibration:
+      b_constant: 3950
+      reference_temperature: 25°C
+      reference_resistance: 10kOhm
+    name: Boiler Temperature
+    id: boiler_temperature
+    accuracy_decimals: 1
+  - platform: resistance
+    id: resistance_sensor
+    sensor: voltage_sensor
+    configuration: DOWNSTREAM
+    resistor: 10kOhm
+    name: Resistance Sensor
+  - platform: ads1115
+    multiplexer: 'A0_A1'
+    update_interval: 333ms
+    gain: 2.048
+    name: "Voltage measured"
+    id: "voltage_sensor"
+    filters:
+      - skip_initial: 5
+      - median:
+          send_every: 3
+          send_first_at: 1
+          window_size: 5
+      - lambda: return (3.29/2.0) - x;
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Example Machine Fallback"
+    password: !secret ap_password
+
+captive_portal:
