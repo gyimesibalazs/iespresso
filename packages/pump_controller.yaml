@@ -1,0 +1,129 @@
+# =====================================================================
+#  PUMP / BREW CONTROLLER  (ESPHome package)
+# =====================================================================
+#  Include from a device config:
+#    packages:
+#      pump: !include packages/pump_controller.yaml
+#  The DEVICE file must provide:
+#    - an `output` with id `pump_ssr`  (a `ledc` output on the pump SSR pin)
+#  This package provides the pump-power ladder + pre-infusion/brew sequence, the
+#  HA number entities and the brew buttons. Physical buttons (GPIO binary_sensors)
+#  stay in the device file and call the scripts `set_pump_pct` / `preinfusion_brew`.
+# =====================================================================
+
+number:
+  - platform: template
+    name: "Pump power"
+    id: pump_power
+    min_value: 0
+    max_value: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+    optimistic: true
+    initial_value: 0
+    set_action:
+      - script.execute:
+          id: set_pump_pct
+          pct: !lambda 'return (int)x;'
+  - platform: template
+    name: "Pre-infusion power"
+    id: preinfusion_pct
+    min_value: 0
+    max_value: 80
+    initial_value: 40
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+  - platform: template
+    name: "Pre-infusion duration"
+    id: preinfusion_duration
+    min_value: 0
+    max_value: 15
+    initial_value: 8
+    step: 0.5
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+  - platform: template
+    name: "Brew duration"
+    id: brew_duration
+    min_value: 5
+    max_value: 60
+    initial_value: 25
+    step: 1
+    unit_of_measurement: "s"
+    optimistic: true
+    restore_value: true
+    entity_category: CONFIG
+
+script:
+  # Snap the incoming pct to a smooth ladder, then drive the pump SSR with hardware
+  # LEDC PWM. Each ladder value is a small M/N fraction of the mains half-cycles, so we
+  # set the frequency to 50/N Hz at M/N duty — the period and duty always fall on a whole
+  # number of mains half-cycles (HIGH >= 20 ms, LOW >= 20 ms). Assumes 50 Hz mains.
+  - id: set_pump_pct
+    mode: restart
+    parameters:
+      pct: int
+    then:
+      - lambda: |-
+          static const int ladder[] =
+            {0, 10, 12, 17, 20, 25, 33, 40, 50, 60, 67, 75, 80, 100};
+          int best = 0, bestd = 999;
+          for (int v : ladder) {
+            int d = abs(pct - v);
+            if (d < bestd) { bestd = d; best = v; }
+          }
+          float freq = 50.0f, duty = 0.0f;
+          switch (best) {
+            case 0:                            duty = 0.0f;     break;
+            case 10:  freq = 5.0f;     duty = 0.10f;    break;
+            case 12:  freq = 6.25f;    duty = 0.125f;   break;
+            case 17:  freq = 8.3333f;  duty = 1.0f/6;   break;
+            case 20:  freq = 10.0f;    duty = 0.20f;    break;
+            case 25:  freq = 12.5f;    duty = 0.25f;    break;
+            case 33:  freq = 16.6667f; duty = 1.0f/3;   break;
+            case 40:  freq = 10.0f;    duty = 0.40f;    break;
+            case 50:  freq = 25.0f;    duty = 0.50f;    break;
+            case 60:  freq = 10.0f;    duty = 0.60f;    break;
+            case 67:  freq = 16.6667f; duty = 2.0f/3;   break;
+            case 75:  freq = 12.5f;    duty = 0.75f;    break;
+            case 80:  freq = 10.0f;    duty = 0.80f;    break;
+            case 100:                          duty = 1.0f;     break;
+          }
+          id(pump_ssr).update_frequency(freq);
+          id(pump_ssr).set_level(duty);
+
+  - id: preinfusion_brew
+    mode: restart
+    then:
+      - script.execute:
+          id: set_pump_pct
+          pct: !lambda 'return (int)id(preinfusion_pct).state;'
+      - delay: !lambda 'return (uint32_t)(id(preinfusion_duration).state * 1000);'
+      - script.execute:
+          id: set_pump_pct
+          pct: 100
+      - delay: !lambda 'return (uint32_t)(id(brew_duration).state * 1000);'
+      - script.execute:
+          id: set_pump_pct
+          pct: 0
+
+button:
+  - platform: template
+    name: "Start brew (with pre-infusion)"
+    icon: "mdi:coffee"
+    on_press:
+      - script.execute: preinfusion_brew
+  - platform: template
+    name: "Stop brew"
+    icon: "mdi:stop"
+    on_press:
+      - script.stop: preinfusion_brew
+      - script.execute:
+          id: set_pump_pct
+          pct: 0
