@@ -17,8 +17,8 @@ substitutions:
   # max_safe_temp, off_cap and the timeouts use the package defaults
 
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.4
-  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.4
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.5
+  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.5
 
 esphome:
   name: example-machine
