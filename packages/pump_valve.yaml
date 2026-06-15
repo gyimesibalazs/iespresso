@@ -1,0 +1,38 @@
+# =====================================================================
+#  3-WAY SOLENOID VALVE  (OPTIONAL add-on for the pump controller)
+# =====================================================================
+#  For machines whose brew group has a 3-way solenoid valve: open it while the
+#  pump runs (pump power > 0) and close it when the pump stops (== 0), so the
+#  group bleeds pressure after the shot.
+#
+#  Include ALONGSIDE pump_controller.yaml and set the GPIO pin:
+#    substitutions:
+#      valve_pin: "26"
+#    packages:
+#      pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.3
+#      valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.3
+#
+#  Requires the pump package (it follows its `pump_power`). Machines without a
+#  valve simply DON'T include this file — nothing else changes.
+# =====================================================================
+
+switch:
+  - platform: gpio
+    pin: ${valve_pin}
+    id: three_way_valve
+    name: "3-way valve"
+    icon: "mdi:pipe-valve"
+    restore_mode: ALWAYS_OFF        # closed at boot
+
+interval:
+  # The valve strictly follows the pump: it is driven automatically and only on
+  # change (no relay chatter, no redundant writes). pump_power is the snapped
+  # level published by set_pump_pct, so every pump path moves the valve.
+  - interval: 100ms
+    then:
+      - lambda: |-
+          bool want = id(pump_power).state > 0.0f;
+          if (want != id(three_way_valve).state) {
+            if (want) id(three_way_valve).turn_on();
+            else      id(three_way_valve).turn_off();
+          }

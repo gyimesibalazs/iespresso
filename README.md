@@ -102,6 +102,33 @@ mains half-cycles, for a zero-cross SSR) and runs a pre-infusion → brew sequen
 - Driven from HA (buttons), from physical buttons (your device's GPIO
   `binary_sensor`s call the scripts), or directly via the `Pump power` slider.
 
+### Why the power ladder (vibration-pump physics)
+
+Espresso machines use a **vibratory (solenoid) pump** — e.g. an Ulka. An AC-driven
+electromagnet pulls a piston against a spring; an internal diode lets the coil pull
+on one half of each mains cycle, so the piston makes **one fixed-volume stroke per
+mains cycle** (50 strokes/s on 50 Hz). It is not a motor you can dim — flow is set
+by **how many strokes you allow**, not by voltage.
+
+So power is controlled by **integral-cycle (burst) switching**: a zero-cross SSR
+passes or blocks *whole* mains half-cycles, letting the pump stroke on some cycles
+and skip others. Average flow ≈ the fraction of cycles passed. This is smooth and
+gentle on the pump, unlike phase-angle dimming (which produces partial strokes,
+noise and heat).
+
+That is what the ladder encodes. Each level is a small fraction **M/N** of the
+cycles (e.g. 1/2 = 50 %, 1/3 = 33 %, 1/6 = 17 %). To realise it exactly, the LEDC
+output runs at **frequency = 50/N Hz** with **duty = M/N**, so one PWM period spans
+exactly *N* half-cycles and the "on" part is exactly *M* of them — every period
+delivers the same whole number of strokes, with no drift. The ladder only contains
+fractions whose on- and off-times are **≥ 20 ms (one full mains cycle)**, the time
+the piston needs to complete a stroke and return; finer patterns would clip strokes.
+
+Practical consequence: **`Pump power` is a flow / stroke-rate setting, not a
+pressure setpoint.** Pressure is whatever that flow builds against the puck and the
+OPV. Pre-infusion at a low % = a low stroke rate = gentle low-flow wetting before
+full pressure.
+
 **Contract — the device file must provide, with this exact ID:**
 
 | Component | id | Notes |
@@ -112,6 +139,26 @@ mains half-cycles, for a zero-cross SSR) and runs a pre-infusion → brew sequen
 (callable from your binary_sensors); numbers `Pump power`, `Pre-infusion power`,
 `Pre-infusion duration`, `Brew duration`; buttons `Start brew (with pre-infusion)`
 and `Stop brew`. (Assumes 50 Hz mains; the ladder is in the package.)
+
+### Optional: 3-way solenoid valve
+
+Machines whose brew group has a 3-way solenoid valve (to bleed group pressure
+after the shot) can add [`packages/pump_valve.yaml`](packages/pump_valve.yaml).
+It opens the valve while the pump runs (pump power > 0) and closes it when the
+pump stops — driven automatically off the pump level, on change only.
+
+Include it **alongside** the pump package and give it a GPIO pin:
+
+```yaml
+substitutions:
+  valve_pin: "26"
+packages:
+  pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.3
+  valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.3
+```
+
+It exposes a `3-way valve` switch in HA (state follows the pump automatically).
+Machines without a valve simply don't include this file — nothing else changes.
 
 ---
 
@@ -134,7 +181,7 @@ substitutions:
   default_tau_cool: "1908.0"
 
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.2
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.3
 
 esphome:
   name: my-rig
@@ -175,8 +222,8 @@ call the pump scripts:
 
 ```yaml
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.2
-  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.2
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.3
+  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.3
 
 output:
   - platform: slow_pwm        # heater SSR
@@ -213,8 +260,9 @@ A complete, working device example (ESP32 + ADS1115 NTC + heater + pump) is in
 [`example-machine.yaml`](example-machine.yaml).
 
 > **Versions.** The controller exists from `v1.0`; the pump package was added in
-> `v1.1`, and `v1.2` makes the pump publish its snapped level to HA history. Use
-> `@v1.2` for both, or pin a later tag as the repo evolves.
+> `v1.1`, `v1.2` makes the pump publish its snapped level to HA history, and `v1.3`
+> adds the optional 3-way valve add-on. Pin `@v1.3` (or a later tag as the repo
+> evolves) so a push to `main` can't change your next build.
 
 ### Local include
 
