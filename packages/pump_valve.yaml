@@ -9,12 +9,26 @@
 #    substitutions:
 #      valve_pin: "26"
 #    packages:
-#      pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.3
-#      valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.3
+#      pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.4
+#      valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.4
 #
 #  Requires the pump package (it follows its `pump_power`). Machines without a
 #  valve simply DON'T include this file — nothing else changes.
 # =====================================================================
+
+# Edge-triggered, not polled: a template binary sensor tracks "pump running"
+# (pump_power is the snapped level set_pump_pct publishes), and its on_press /
+# on_release fire the valve ONLY on the 0<->>0 transition — so every pump path
+# (jog, brew sequence, slider, HA) moves the valve, with no relay chatter.
+binary_sensor:
+  - platform: template
+    id: pump_running
+    internal: true
+    lambda: "return id(pump_power).state > 0.0f;"
+    on_press:
+      - switch.turn_on: three_way_valve
+    on_release:
+      - switch.turn_off: three_way_valve
 
 switch:
   - platform: gpio
@@ -23,16 +37,3 @@ switch:
     name: "3-way valve"
     icon: "mdi:pipe-valve"
     restore_mode: ALWAYS_OFF        # closed at boot
-
-interval:
-  # The valve strictly follows the pump: it is driven automatically and only on
-  # change (no relay chatter, no redundant writes). pump_power is the snapped
-  # level published by set_pump_pct, so every pump path moves the valve.
-  - interval: 100ms
-    then:
-      - lambda: |-
-          bool want = id(pump_power).state > 0.0f;
-          if (want != id(three_way_valve).state) {
-            if (want) id(three_way_valve).turn_on();
-            else      id(three_way_valve).turn_off();
-          }

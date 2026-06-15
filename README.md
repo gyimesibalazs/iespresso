@@ -153,8 +153,8 @@ Include it **alongside** the pump package and give it a GPIO pin:
 substitutions:
   valve_pin: "26"
 packages:
-  pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.3
-  valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.3
+  pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.4
+  valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.4
 ```
 
 It exposes a `3-way valve` switch in HA (state follows the pump automatically).
@@ -181,7 +181,7 @@ substitutions:
   default_tau_cool: "1908.0"
 
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.3
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.4
 
 esphome:
   name: my-rig
@@ -222,8 +222,8 @@ call the pump scripts:
 
 ```yaml
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.3
-  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.3
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.4
+  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.4
 
 output:
   - platform: slow_pwm        # heater SSR
@@ -260,9 +260,10 @@ A complete, working device example (ESP32 + ADS1115 NTC + heater + pump) is in
 [`example-machine.yaml`](example-machine.yaml).
 
 > **Versions.** The controller exists from `v1.0`; the pump package was added in
-> `v1.1`, `v1.2` makes the pump publish its snapped level to HA history, and `v1.3`
-> adds the optional 3-way valve add-on. Pin `@v1.3` (or a later tag as the repo
-> evolves) so a push to `main` can't change your next build.
+> `v1.1`, `v1.2` makes the pump publish its snapped level to HA history, `v1.3` adds
+> the optional 3-way valve add-on, and `v1.4` makes that valve edge-triggered. Pin
+> `@v1.4` (or a later tag as the repo evolves) so a push to `main` can't change your
+> next build.
 
 ### Local include
 
