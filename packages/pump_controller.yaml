@@ -97,6 +97,11 @@ script:
           }
           id(pump_ssr).update_frequency(freq);
           id(pump_ssr).set_level(duty);
+          // Reflect the ACTUAL (ladder-snapped) level back to the "Pump power" entity, so
+          // every path (jog button, brew switch, pre-infusion/brew sequence, HA buttons) is
+          // visible and logged in HA history. publish_state only updates the displayed state;
+          // it does NOT trigger the number's set_action, so there is no script-restart loop.
+          id(pump_power).publish_state((float)best);
 
   - id: preinfusion_brew
     mode: restart
