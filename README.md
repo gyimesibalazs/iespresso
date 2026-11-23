@@ -39,11 +39,30 @@ its own physical parameters, so there is no manual tuning.
 
 | Component | id | Notes |
 |-----------|----|-------|
-| an `output` | `heater` | the SSR driver — `slow_pwm` (zero-cross SSR) or `ledc` (1 Hz) |
+| an `output` | `heater` | the SSR driver — `ledc` at 1 Hz on its own LEDC timer (see [Heater output](#heater-output)) |
 | a `sensor` | `boiler_temperature` | an `ntc` sensor + its source chain (resistance + ADC/ADS1115) |
 
 Everything else (the tunable `number:` entities, the climate shell, the tune
 state machine, diagnostics) comes from the package.
+
+### Heater output
+
+Drive the heater SSR with a `ledc` output at `frequency: 1Hz`. The LEDC hardware
+holds the SSR input on for exactly *level* × 1 s and takes a new level at the start
+of the next period, so on a zero-cross SSR 1 % is exactly one 50 Hz mains half-cycle
+— the same unit the controller quantizes to and the model counts with.
+
+On the ESP32 the channels 2n and 2n+1 share LEDC timer n. The pump package re-tunes
+its channel's timer on every level change, so with the pump on channel 1 put the
+heater on channel 2 or higher.
+
+Don't use `slow_pwm`: it switches from the main loop, so a pulse starts and ends at
+the first loop pass after its time. With the display redrawing, a loop pass takes up
+to ~50 ms (five half-cycles), and both the redraw and the controller run once a
+second, so the error does not average out: the short pulses that hold the
+temperature can deliver a lot more (or less) heat than asked for. On the reference
+machine a plug meter measured about 50 % more energy per percent of output in hold
+than at full power.
 
 ### Substitutions
 
@@ -54,7 +73,7 @@ values and `restore_value` keeps them across reboots.
 | Substitution | Default | Meaning |
 |--------------|---------|---------|
 | `base_power_w` | `0.7` | idle (controller/electronics) draw, W |
-| `device_power_w` | `1200` | heater power, W |
+| `device_power_w` | `1200` | heater power, W — measure it: the "Power consumption" sensor is calculated from it |
 | `max_safe_temp_c` | `110.0` | absolute emergency-stop temperature, °C |
 | `default_heating_power` | `0.543` | P — heating power, °C/s |
 | `default_coil_tau` | `48.86` | `tau_coil` — coil→boiler transfer constant, s |
@@ -135,6 +154,11 @@ full pressure.
 |-----------|----|-------|
 | an `output` | `pump_ssr` | a `ledc` output on the pump SSR pin (the script sets its frequency + duty) |
 
+The pump package needs the controller package: with `pump_power_w` (the pump's draw
+at 100 %, W; default `0` = not counted) its draw goes into the "Power consumption"
+sensor, in proportion to the half-cycles the pump is given. Vibration pumps draw
+about 50–70 W.
+
 **Provides:** scripts `set_pump_pct` (pct → ladder → SSR) and `preinfusion_brew`
 (callable from your binary_sensors); numbers `Pump power`, `Pre-infusion power`,
 `Pre-infusion duration`, `Brew duration`; buttons `Start brew (with pre-infusion)`
@@ -153,8 +177,8 @@ Include it **alongside** the pump package and give it a GPIO pin:
 substitutions:
   valve_pin: "26"
 packages:
-  pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.5
-  valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.5
+  pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.6
+  valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.6
 ```
 
 It exposes a `3-way valve` switch in HA (state follows the pump automatically).
@@ -181,7 +205,7 @@ substitutions:
   default_tau_cool: "1908.0"
 
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.5
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.6
 
 esphome:
   name: my-rig
@@ -191,7 +215,7 @@ esp32:
 
 # --- the two things the controller package needs ---
 output:
-  - platform: ledc          # or slow_pwm for a zero-cross SSR
+  - platform: ledc          # hardware-timed: 1 % = one 50 Hz half-cycle
     frequency: 1Hz
     channel: 0
     id: heater
@@ -222,12 +246,13 @@ call the pump scripts:
 
 ```yaml
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.5
-  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.5
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.6
+  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.6
 
 output:
-  - platform: slow_pwm        # heater SSR
-    period: 1s
+  - platform: ledc            # heater SSR
+    frequency: 1Hz
+    channel: 2                # LEDC timer 1 — the pump re-tunes timer 0 (channels 0-1)
     id: heater
     pin: 14
   - platform: ledc            # pump SSR — required by the pump package
@@ -262,7 +287,7 @@ A complete, working device example (ESP32 + ADS1115 NTC + heater + pump) is in
 > **Versions.** The controller exists from `v1.0`; the pump package was added in
 > `v1.1`, `v1.2` makes the pump publish its snapped level to HA history, `v1.3` adds
 > the optional 3-way valve add-on, `v1.4` makes that valve edge-triggered, and
-> `v1.5` raises the max brew duration to 180 s. Pin `@v1.5` (or a later tag as the
+> `v1.5` raises the max brew duration to 180 s. Pin `@v1.6` (or a later tag as the
 > repo evolves) so a push to `main` can't change your next build.
 
 ### Local include

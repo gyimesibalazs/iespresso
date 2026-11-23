@@ -5,7 +5,14 @@
 #    packages:
 #      controller: !include packages/espresso_controller.yaml
 #  The DEVICE file must provide:
-#    - an `output` with id `heater`         (the SSR driver: ledc or slow_pwm)
+#    - an `output` with id `heater`         (the SSR driver: `ledc` at 1 Hz, see below)
+#  Heater output: use `ledc` with `frequency: 1Hz` on a channel whose LEDC timer no
+#  other output re-tunes (on the ESP32 channels 2n and 2n+1 share timer n; the pump
+#  package changes the frequency of its channel's timer). The hardware then holds the
+#  SSR on for exactly level x 1 s, so on a zero-cross SSR 1 % is exactly one 50 Hz
+#  half-cycle. `slow_pwm` switches from the main loop instead: every pulse ends at the
+#  first loop pass after its time (the loop takes up to ~50 ms while the display
+#  redraws), so short hold pulses can deliver a lot more (or less) heat than asked.
 #    - a `sensor` with id `boiler_temperature` and its source chain
 #  Tuned values and hardware power are passed via substitutions — override any of
 #  the defaults below in the device's own `substitutions:` block. The overnight
@@ -47,6 +54,10 @@ globals:
     initial_value: '0.0'     # no separate interval / drift.
   - id: last_heater_level    # last actually applied heating level (0..1)
     type: float
+    restore_value: no
+    initial_value: '0.0'
+  - id: aux_power_w          # draw of other loads [W] that the "Power consumption" sensor
+    type: float              # adds to the heater (the pump package writes its pump here)
     restore_value: no
     initial_value: '0.0'
   - id: quant_error          # error diffusion: the quantization remainder carried to the next cycle
@@ -336,7 +347,7 @@ output:
             if (id(tune_phase) > 0 && id(tune_phase) < 6) {
               // keep the power sensor alive during tuning — the tune machine maintains
               // last_heater_level alongside its direct heater writes
-              id(calculated_power).publish_state(id(last_heater_level) * id(device_power).state + ${base_power_w}f);
+              id(calculated_power).publish_state(id(last_heater_level) * id(device_power).state + ${base_power_w}f + id(aux_power_w));
               return id(last_heater_level);
             }
 
@@ -353,7 +364,7 @@ output:
               id(stable_since) = 0;
               id(heatup_start) = 0;          // clear the progress-bar anchor when not heating
               id(boiler_pid).reset_integral_term();
-              id(calculated_power).publish_state(${base_power_w}f);   // base (controller) consumption only
+              id(calculated_power).publish_state(${base_power_w}f + id(aux_power_w));   // no heating: electronics + other loads
               return 0.0f;
             }
 
@@ -364,7 +375,7 @@ output:
             // (NaN/unknown on the sensor, until the first ADS1115+median sample), we do NOT
             // heat. Typically only the first few seconds after power-on.
             if (!id(measurement_ready) || !tb_valid) {
-              id(calculated_power).publish_state(${base_power_w}f);
+              id(calculated_power).publish_state(${base_power_w}f + id(aux_power_w));
               return 0.0f;
             }
 
@@ -526,9 +537,9 @@ output:
             // ---- 3c) error-diffusion quantization to whole % ----
             // Whole-% output with the remainder FED BACK into the next cycle (error
             // feedback / dithering): every cycle we output a whole %, BUT the long-term
-            // average stays exactly the demand. With ledc (high-res PWM) the rounding is
-            // cosmetic; it mainly matters on an integral-cycle SSR where 1% = 1 mains
-            // half-cycle. Harmless here, kept for parity with the model.
+            // average stays exactly the demand. With a 1 Hz ledc output on a zero-cross
+            // SSR 1% is exactly one 50 Hz mains half-cycle, so the SSR delivers what is
+            // asked for (a fraction of a half-cycle would be rounded by the SSR instead).
             // If the protection set 0, we do NOT diffuse (the hardware forbids heating).
             if (out <= 0.0f) {
               id(quant_error) = 0.0f;                   // protection active: nothing to carry
@@ -633,7 +644,7 @@ output:
             // ---- 5) update power consumption HERE, from the actual (limited) out ----
             // Here, where the real output is produced (after limiting).
             // out: 0..1 scale, so NO /100. +base_power_w is the base consumption (control).
-            id(calculated_power).publish_state(out * id(device_power).state + ${base_power_w}f);
+            id(calculated_power).publish_state(out * id(device_power).state + ${base_power_w}f + id(aux_power_w));
 
             return out;
 

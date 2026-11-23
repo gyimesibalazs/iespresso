@@ -9,7 +9,15 @@
 #  This package provides the pump-power ladder + pre-infusion/brew sequence, the
 #  HA number entities and the brew buttons. Physical buttons (GPIO binary_sensors)
 #  stay in the device file and call the scripts `set_pump_pct` / `preinfusion_brew`.
+#  Needs the controller package too: the pump's draw (pump_power_w x the fraction of
+#  half-cycles passed) goes into its "Power consumption" sensor via `aux_power_w`.
+#  pump_ssr's LEDC timer is re-tuned on every level change, so no other output may
+#  share it (on the ESP32 channels 2n and 2n+1 share timer n).
 # =====================================================================
+
+substitutions:
+  pump_power_w: "0"              # pump draw at 100 % [W] (vibration pumps: ~50-70 W);
+                                 # 0 leaves the pump out of the power estimate
 
 number:
   - platform: template
@@ -97,6 +105,8 @@ script:
           }
           id(pump_ssr).update_frequency(freq);
           id(pump_ssr).set_level(duty);
+          // energy estimate: a vibration pump draws per half-cycle it is given
+          id(aux_power_w) = duty * (float) (${pump_power_w});
           // Reflect the ACTUAL (ladder-snapped) level back to the "Pump power" entity, so
           // every path (jog button, brew switch, pre-infusion/brew sequence, HA buttons) is
           // visible and logged in HA history. publish_state only updates the displayed state;
