@@ -5,15 +5,16 @@
 #    packages:
 #      controller: !include packages/espresso_controller.yaml
 #  The DEVICE file must provide:
-#    - an `output` with id `heater`         (the SSR driver: `ledc` at 1 Hz, see below)
-#  Heater output: use `ledc` with `frequency: 1Hz` on a channel whose LEDC timer no
-#  other output re-tunes (on the ESP32 channels 2n and 2n+1 share timer n; the pump
-#  package changes the frequency of its channel's timer). The hardware then holds the
-#  SSR on for exactly level x 1 s, so on a zero-cross SSR 1 % is exactly one 50 Hz
-#  half-cycle. `slow_pwm` switches from the main loop instead: every pulse ends at the
-#  first loop pass after its time (the loop takes up to ~50 ms while the display
-#  redraws), so short hold pulses can deliver a lot more (or less) heat than asked.
+#    - a `gpio` output with id `heater_ssr`  (the heater SSR's pin)
 #    - a `sensor` with id `boiler_temperature` and its source chain
+#  The package turns heater_ssr into the heater output (`heater`): every control step
+#  (one temperature sample, ~1 s) switches the SSR on, and a one-shot hardware timer
+#  (esp_timer) switches it off after level x 1 s, so the heat of each step is exact
+#  and starts at once: on a zero-cross SSR 1 % is one 50 Hz half-cycle. `slow_pwm`
+#  switches from the main loop (up to ~50 ms late while the display redraws). A 1 Hz
+#  `ledc` takes a new duty only at the period end, and on the reference machine it
+#  delivered about twice the heat per percent in hold (an ESP32 LEDC duty update
+#  stays pending for a second period, so a level can last 2 s).
 #  Tuned values and hardware power are passed via substitutions — override any of
 #  the defaults below in the device's own `substitutions:` block. The overnight
 #  tune and the daily adaptive overwrite the live values at runtime (restore_value
@@ -270,6 +271,27 @@ globals:
     initial_value: '0.0'
 
 output:
+  # Heater: one exact pulse per control step (see the header). level >= 99.5 % stays on
+  # until the next step, 0 switches off at once.
+  - platform: template
+    id: heater
+    type: float
+    write_action:
+      - lambda: |-
+          static esp_timer_handle_t off_timer = nullptr;
+          if (off_timer == nullptr) {
+            esp_timer_create_args_t args = {};
+            args.callback = [](void *) { id(heater_ssr).turn_off(); };
+            args.dispatch_method = ESP_TIMER_TASK;
+            args.name = "heater_off";
+            esp_timer_create(&args, &off_timer);
+          }
+          esp_timer_stop(off_timer);            // an error when it is not running: fine
+          if (state <= 0.0f) { id(heater_ssr).turn_off(); return; }
+          id(heater_ssr).turn_on();
+          if (state < 0.995f)
+            esp_timer_start_once(off_timer, (uint64_t) (state * 1000000.0f));
+
   # =====================================================================
   #  MODEL-BASED THROTTLE — the template output that drives the heater.
   #  The heater level comes entirely from the two-state model's proportional
@@ -537,9 +559,9 @@ output:
             // ---- 3c) error-diffusion quantization to whole % ----
             // Whole-% output with the remainder FED BACK into the next cycle (error
             // feedback / dithering): every cycle we output a whole %, BUT the long-term
-            // average stays exactly the demand. With a 1 Hz ledc output on a zero-cross
-            // SSR 1% is exactly one 50 Hz mains half-cycle, so the SSR delivers what is
-            // asked for (a fraction of a half-cycle would be rounded by the SSR instead).
+            // average stays exactly the demand. The heater output pulses level x 1 s per
+            // step, so on a zero-cross SSR 1% is exactly one 50 Hz mains half-cycle and the
+            // SSR delivers what is asked for (it would round a fraction of a half-cycle).
             // If the protection set 0, we do NOT diffuse (the hardware forbids heating).
             if (out <= 0.0f) {
               id(quant_error) = 0.0f;                   // protection active: nothing to carry

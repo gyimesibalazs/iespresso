@@ -39,7 +39,7 @@ its own physical parameters, so there is no manual tuning.
 
 | Component | id | Notes |
 |-----------|----|-------|
-| an `output` | `heater` | the SSR driver — `ledc` at 1 Hz on its own LEDC timer (see [Heater output](#heater-output)) |
+| a `gpio` output | `heater_ssr` | the heater SSR's pin (see [Heater output](#heater-output)) |
 | a `sensor` | `boiler_temperature` | an `ntc` sensor + its source chain (resistance + ADC/ADS1115) |
 
 Everything else (the tunable `number:` entities, the climate shell, the tune
@@ -47,22 +47,23 @@ state machine, diagnostics) comes from the package.
 
 ### Heater output
 
-Drive the heater SSR with a `ledc` output at `frequency: 1Hz`. The LEDC hardware
-holds the SSR input on for exactly *level* × 1 s and takes a new level at the start
-of the next period, so on a zero-cross SSR 1 % is exactly one 50 Hz mains half-cycle
-— the same unit the controller quantizes to and the model counts with.
+The device gives the heater SSR's pin as a `gpio` output with id `heater_ssr`; the
+package builds the heater output on top of it. Every control step (one temperature
+sample, about once a second) switches the SSR on, and a one-shot hardware timer
+(`esp_timer`) switches it off after *level* × 1 s. The heat of each step is exact and
+starts at once: on a zero-cross SSR 1 % is one 50 Hz half-cycle, the unit the
+controller quantizes to and the model counts with.
 
-On the ESP32 the channels 2n and 2n+1 share LEDC timer n. The pump package re-tunes
-its channel's timer on every level change, so with the pump on channel 1 put the
-heater on channel 2 or higher.
+Earlier versions took any float output as `heater`. Two common choices do not work
+well for the short pulses that hold the temperature:
 
-Don't use `slow_pwm`: it switches from the main loop, so a pulse starts and ends at
-the first loop pass after its time. With the display redrawing, a loop pass takes up
-to ~50 ms (five half-cycles), and both the redraw and the controller run once a
-second, so the error does not average out: the short pulses that hold the
-temperature can deliver a lot more (or less) heat than asked for. On the reference
-machine a plug meter measured about 50 % more energy per percent of output in hold
-than at full power.
+- `slow_pwm` switches from the main loop, so a pulse starts and ends at the first loop
+  pass after its time; while the display redraws, a pass takes up to ~50 ms (five
+  half-cycles).
+- A 1 Hz `ledc` (v1.6) takes a new duty only at the end of the period, and on the
+  reference machine it delivered about twice the heat per percent in hold: on the
+  ESP32 a LEDC duty update stays pending for a second period, so a level can last
+  2 s and the next one is lost. The hold swung 0.5 °C instead of 0.2 °C.
 
 ### Substitutions
 
@@ -177,8 +178,8 @@ Include it **alongside** the pump package and give it a GPIO pin:
 substitutions:
   valve_pin: "26"
 packages:
-  pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.6
-  valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.6
+  pump:  github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.7
+  valve: github://gyimesibalazs/iespresso/packages/pump_valve.yaml@v1.7
 ```
 
 It exposes a `3-way valve` switch in HA (state follows the pump automatically).
@@ -205,7 +206,7 @@ substitutions:
   default_tau_cool: "1908.0"
 
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.6
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.7
 
 esphome:
   name: my-rig
@@ -215,10 +216,8 @@ esp32:
 
 # --- the two things the controller package needs ---
 output:
-  - platform: ledc          # hardware-timed: 1 % = one 50 Hz half-cycle
-    frequency: 1Hz
-    channel: 0
-    id: heater
+  - platform: gpio          # heater SSR: the package times the pulses
+    id: heater_ssr
     pin: 27
 
 sensor:
@@ -246,14 +245,12 @@ call the pump scripts:
 
 ```yaml
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.6
-  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.6
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.7
+  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.7
 
 output:
-  - platform: ledc            # heater SSR
-    frequency: 1Hz
-    channel: 2                # LEDC timer 1 — the pump re-tunes timer 0 (channels 0-1)
-    id: heater
+  - platform: gpio            # heater SSR: the package times the pulses
+    id: heater_ssr
     pin: 14
   - platform: ledc            # pump SSR — required by the pump package
     pin: 19
@@ -287,7 +284,7 @@ A complete, working device example (ESP32 + ADS1115 NTC + heater + pump) is in
 > **Versions.** The controller exists from `v1.0`; the pump package was added in
 > `v1.1`, `v1.2` makes the pump publish its snapped level to HA history, `v1.3` adds
 > the optional 3-way valve add-on, `v1.4` makes that valve edge-triggered, and
-> `v1.5` raises the max brew duration to 180 s. Pin `@v1.6` (or a later tag as the
+> `v1.5` raises the max brew duration to 180 s. Pin `@v1.7` (or a later tag as the
 > repo evolves) so a push to `main` can't change your next build.
 
 ### Local include

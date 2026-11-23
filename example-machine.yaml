@@ -18,8 +18,8 @@ substitutions:
   # max_safe_temp, off_cap and the timeouts use the package defaults
 
 packages:
-  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.6
-  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.6
+  controller: github://gyimesibalazs/iespresso/packages/espresso_controller.yaml@v1.7
+  pump:       github://gyimesibalazs/iespresso/packages/pump_controller.yaml@v1.7
 
 esphome:
   name: example-machine
@@ -40,12 +40,10 @@ ads1115:
   - address: 0x48
     continuous_mode: true
 
-# --- SSR outputs: heater (id `heater`) + pump (id `pump_ssr`), required by the packages ---
+# --- SSR outputs: heater (id `heater_ssr`) + pump (id `pump_ssr`), required by the packages ---
 output:
-  - platform: ledc              # heater SSR: hardware-timed, 1 % = one 50 Hz half-cycle
-    frequency: 1Hz
-    channel: 2                  # LEDC timer 1: the pump re-tunes timer 0 (channels 0-1)
-    id: heater
+  - platform: gpio              # heater SSR: the controller package times the pulses
+    id: heater_ssr
     pin: 14
   - platform: ledc              # pump SSR — set_pump_pct sets frequency + duty
     pin: 19
